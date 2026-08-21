@@ -1,161 +1,75 @@
-import { execSync } from "child_process"
-import path from "path"
-import os from "os"
-import { writeFileSync } from "fs"
-import { z } from "zod"
+import { execFile } from "node:child_process"
+import { promises as fs } from "node:fs"
+import { Plugin } from "@opencode-ai/plugin"
+import { SshConnections, transformShellExecuteBefore, type ProcessRunner } from "./ssh.js"
 
-type SessionState = {
-  host: string
-  socketPath: string
-}
-
-const sessionMap = new Map<string, SessionState>()
-
-function sock(host: string) {
-  return path.join(os.homedir(), ".ssh", `cm-${host}`)
-}
-
-function ensureSentinel(): string {
-  const p = path.join(os.tmpdir(), "__opencode_remote_mode__")
-  try {
-    writeFileSync(
-      p,
-      "This tool is not available in remote SSH mode.\nUse the bash tool with cat/tee/grep/find over SSH instead.\n",
-    )
-  } catch {}
-  return p
-}
-
-let sentinel: string
-
-export default {
-  id: "opencode-ssh",
-  server: async () => {
-    sentinel ??= ensureSentinel()
-
-    return {
-      tool: {
-        ssh_connect: {
-          description:
-            "Open a persistent SSH connection to a remote server. Call this when the user says 'ssh <host>' or asks to connect to a server. The host must be defined in ~/.ssh/config.",
-          args: {
-            host: z.string().describe("SSH host name from ~/.ssh/config, e.g. 'myHost'"),
-          },
-          async execute(args, ctx) {
-            const host = args.host
-            const socketPath = sock(host)
-
-            const existing = sessionMap.get(ctx.sessionID)
-            if (existing) {
-              try {
-                execSync(`ssh -O stop -S "${existing.socketPath}" "${existing.host}"`, { stdio: "pipe" })
-              } catch {}
-            }
-
-            try {
-              execSync(`ssh -MNf -S "${socketPath}" "${host}" 2>&1`, { stdio: "pipe", timeout: 15000 })
-            } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e)
-              return `Failed to connect to ${host}: ${msg}`
-            }
-
-            sessionMap.set(ctx.sessionID, { host, socketPath })
-
-            return {
-              title: `Connected to ${host}`,
-              output: [
-                `SSH connection to **${host}** established. All bash commands will now run remotely.`,
-                `Use bash with \`cat\`, \`tee\`, \`grep\`, \`find\` for file operations.`,
-                `Say "local" to disconnect.`,
-              ].join("\n"),
-            }
-          },
-        },
-
-        ssh_disconnect: {
-          description: "Close the persistent SSH connection and return to local mode. Call this when the user says 'local' or asks to disconnect.",
-          args: {},
-          async execute(_args, ctx) {
-            const state = sessionMap.get(ctx.sessionID)
-            if (!state) return "Not currently connected."
-
-            try {
-              execSync(`ssh -O stop -S "${state.socketPath}" "${state.host}"`, { stdio: "pipe" })
-            } catch {}
-            sessionMap.delete(ctx.sessionID)
-
-            return "Disconnected. Commands now run locally."
-          },
-        },
-      },
-
-      "tool.execute.before": async (input, output) => {
-        const state = sessionMap.get(input.sessionID)
-        if (!state) return
-
-        if (input.tool === "bash") {
-          const cmd = output.args.command
-          if (cmd.startsWith(`ssh -S "${state.socketPath}"`)) return
-          output.args.command = `ssh -S "${state.socketPath}" "${state.host}" ${cmd}`
-          if (output.args.description) {
-            output.args.description = `[remote ${state.host}] ${output.args.description}`
-          }
-          return
+const runner: ProcessRunner = {
+  run(file, args, options) {
+    return new Promise((resolve, reject) => {
+      execFile(file, args, { ...options, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+        if (error) {
+          Object.assign(error, { stderr })
+          reject(error)
         }
-
-        if (input.tool === "read") {
-          output.args.filePath = sentinel
-          output.args.offset = undefined
-          output.args.limit = undefined
-          return
-        }
-
-        if (input.tool === "write") {
-          output.args.filePath = path.join(os.tmpdir(), `__opencode_remote_write__`)
-          output.args.content = "This tool is not available in remote mode."
-          return
-        }
-
-        if (input.tool === "edit") {
-          output.args.filePath = sentinel
-          output.args.oldString = "SENTINEL_MARKER_THAT_WILL_NEVER_EXIST"
-          output.args.newString = ""
-          output.args.replaceAll = false
-          return
-        }
-
-        if (input.tool === "glob") {
-          output.args.pattern = `__OPECODE_REMOTE_GLOB_UNAVAILABLE__`
-          output.args.path = "/tmp"
-          return
-        }
-
-        if (input.tool === "grep") {
-          output.args.pattern = `^__OPECODE_REMOTE_GREP_UNAVAILABLE__$`
-          output.args.path = "/tmp"
-          output.args.include = undefined
-          return
-        }
-      },
-
-      "experimental.chat.system.transform": async (input, output) => {
-        const state = input.sessionID ? sessionMap.get(input.sessionID) : undefined
-        if (!state) return
-
-        output.system.push(
-          [
-            "",
-            "## Remote SSH Mode",
-            "",
-            `You are connected to **${state.host}** via persistent SSH.`,
-            "",
-            "1. The **bash** tool is automatically wrapped with SSH. Do NOT add SSH yourself.",
-            "2. Use bash with `cat`, `tee`, `grep`, `find` for all remote file ops.",
-            "3. Native `read`/`write`/`edit`/`glob`/`grep` tools are disabled in remote mode.",
-            "4. Say \"local\" to disconnect.",
-          ].join("\n"),
-        )
-      },
-    }
+        else resolve({ stdout, stderr, code: 0 })
+      })
+    })
   },
 }
+
+const input = {
+  type: "object",
+  properties: { host: { type: "string", description: "SSH host alias from ~/.ssh/config" } },
+  required: ["host"],
+  additionalProperties: false,
+} as const
+
+export default Plugin.define({
+  id: "opencode-ssh",
+  async setup(ctx) {
+    const connections = new SshConnections({ runner, fs: {
+      mkdir: async (path, options) => { await fs.mkdir(path, options) },
+      rm: async (path, options) => { await fs.rm(path, options) },
+      exists: async (path) => { try { await fs.stat(path); return true } catch { return false } },
+    } })
+    await ctx.tool.transform((draft) => {
+      draft.add({
+        name: "ssh_connect",
+        description: "Connect to an SSH host alias from ~/.ssh/config.",
+        input,
+        async execute(args, toolCtx) {
+          try {
+            const state = await connections.connect(toolCtx.sessionID, (args as { host: string }).host)
+            return { output: `Connected to ${state.host}. Shell commands now run remotely. Use ssh_disconnect to return local.` }
+          } catch (error) {
+            return { output: error instanceof Error ? error.message : String(error) }
+          }
+        },
+      })
+      draft.add({
+        name: "ssh_disconnect",
+        description: "Disconnect the current SSH session and return to local mode.",
+        input: { type: "object", properties: {}, additionalProperties: false },
+        async execute(_args, toolCtx) {
+          await connections.disconnect(toolCtx.sessionID)
+          return { output: "Disconnected. Shell commands now run locally." }
+        },
+      })
+    })
+
+    await ctx.tool.hook("execute.before", (event) => {
+      transformShellExecuteBefore(event, (sessionID) => connections.get(sessionID))
+    })
+
+    await ctx.session.hook("context", (context) => {
+      const state = connections.get(context.sessionID)
+      if (!state) return
+      for (const name of ["read", "edit", "glob", "grep"]) delete context.tools[name]
+      context.system.push({ type: "text", text: `Remote SSH mode is active for ${state.host}. Shell commands are deterministically executed through SSH. Use ssh_disconnect to return local mode; do not add SSH yourself.` })
+    })
+
+    return async () => { await connections.cleanup() }
+  },
+})
+
+export { SshConnections, quotePosix, socketPath, transformShellExecuteBefore, validateHost, wrapRemoteCommand } from "./ssh.js"

@@ -1,58 +1,60 @@
 # opencode-ssh
 
-Run opencode on a remote server. Say "ssh myHost" and all commands run remotely.
+An OpenCode v2 plugin that runs shell commands through a persistent SSH ControlMaster. It uses SSH host aliases from `~/.ssh/config`; OpenCode itself does not need to be installed on the remote host.
 
-- No need to install opencode remotely or expose API keys on the server.
-- Reuses the same open ssh connection for performance, remembers last working folder, remote open docker connections etc.
+## Install
 
-Use to rapidly investigate incidents on remote servers, troubleshoot, analyze logs, data etc.
-
-## Setup
-
-**1. Copy the plugin**
+Install the package in the OpenCode config directory. For a local source checkout, use `--install-links` so npm copies the package instead of creating a symlink with a missing runtime dependency:
 
 ```sh
-mkdir -p ~/.config/opencode/plugins
-cp src/index.ts ~/.config/opencode/plugins/remote.ts
+npm install --prefix ~/.config/opencode --install-links /path/to/opencode-ssh
 ```
 
-**2. Create an agent**
+Add it to `~/.config/opencode/opencode.json`:
 
-`.opencode/agent/remote.md`:
-```markdown
----
-description: Run commands on a remote server via SSH
-color: primary
-mode: primary
----
-
-When the user says "ssh <host>", use `ssh_connect` with the host name.
-When they say "local", use `ssh_disconnect`.
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [{"package": "./node_modules/opencode-ssh", "options": {}}]
+}
 ```
+
+For a local source checkout, reference the installed package by its explicit local path, `./node_modules/opencode-ssh`. A bare package name like `opencode-ssh` is treated as an npm registry dependency (and fails with `No versions available for opencode-ssh`). Local paths must start with `./` and are resolved relative to `~/.config/opencode/opencode.json`.
+
+The plugin requires the OpenCode v2 beta plugin runtime.
 
 ## Usage
 
-1. Switch to the **Remote** agent tab.
-2. Say **"ssh myHost"** (replace `myHost` with a host from `~/.ssh/config`).
-3. Ask anything — `bash` commands automatically run on the remote server.
-4. Say **"local"** to disconnect.
+Ask the model to connect to an alias, for example:
 
-## How it works
-
-- Opens SSH ControlMaster (`ssh -MNf ...`) for a persistent connection.
-- Hooks into `tool.execute.before` to wrap `bash` calls with SSH at runtime.
-- Disables local file tools (`read`, `write`, `edit`, `glob`, `grep`) in remote mode.
-- Injects remote-mode instructions into the system prompt.
-
-## Example `~/.ssh/config`
-
+```text
+Connect to myHost
 ```
+
+The model calls `ssh_connect`. After connection, the v2 shell tool hook rewrites every shell command using that OpenCode session's persistent ControlMaster. This is not dependent on prompt instructions. Remote commands start in the SSH login shell's working directory; the plugin does not preserve OpenCode's local cwd. Use `ssh_disconnect` or ask to return local to close it.
+
+## SSH setup
+
+Use an SSH key or an SSH agent. Password prompts and `sshpass` are intentionally unsupported.
+
+```sshconfig
 Host myHost
-    Hostname 192.100.100.100
+    HostName 192.0.2.10
     User username
     ServerAliveInterval 60
 ```
 
-On the remote server, add your public key in `~/.ssh/authorized_keys`
+Ensure the public key is in the remote user's `~/.ssh/authorized_keys` and verify `ssh myHost` works before using the plugin.
 
-With this entry, you say "ssh myHost" to connect. The `Host` value is the name you use in conversation.
+## Files
+
+Shell file commands such as `cat`, `tee`, `find`, and remote `grep` run on the server. OpenCode's local `read`, `edit`, `glob`, and `grep` tools are removed from the session context while remote mode is active, preventing accidental local edits or searches. Disconnect to restore local tools.
+
+Control sockets are kept in a private `~/.ssh/opencode-ssh` directory with mode `0700`, use collision-resistant names, and are removed when a session disconnects or the plugin is cleaned up. Stale sockets are discarded and healthy masters are reused.
+
+## Troubleshooting
+
+- `Invalid SSH host`: use a host alias or hostname containing only letters, numbers, `.`, `_`, `:`, or `-`; shell metacharacters are rejected.
+- Connection failure: run `ssh -v myHost` manually and check key, agent, hostname, and SSH config settings.
+- Permission denied for the socket directory: ensure the home directory and `~/.ssh` are writable by the current user.
+- Commands still run locally: confirm the v2 plugin is installed in the active config and that `ssh_connect` completed successfully.
