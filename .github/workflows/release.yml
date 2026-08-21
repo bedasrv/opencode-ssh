@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release
+    if: github.repository == 'bedasrv/opencode-ssh'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish to npm
+    if: github.repository == 'bedasrv/opencode-ssh'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out tagged release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Validate tag matches package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(node -p "require('./package.json').version")"
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "Tag v$tag_version does not match package.json version $package_version" >&2
+            exit 1
+          fi
+
+      - name: Publish package with provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public

@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version:
+          - 20.x
+          - 22.x
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm test
+
+      - name: Rebuild package artifacts
+        run: npm run build
+
+      - name: Check generated artifacts are committed
+        run: git diff --exit-code -- dist/src
+
+  package:
+    name: Validate package
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Build package
+        run: npm run build
+
+      - name: Check generated artifacts are committed
+        run: git diff --exit-code -- dist/src
+
+      - name: Validate package contents and import
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --dry-run --json > pack.json
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs"
+
+          const [pack] = JSON.parse(readFileSync("pack.json", "utf8"))
+          const expected = [
+            "README.md",
+            "dist/src/index.d.ts",
+            "dist/src/index.js",
+            "dist/src/ssh.d.ts",
+            "dist/src/ssh.js",
+            "package.json",
+          ]
+          const actual = pack.files.map(({ path }) => path).sort()
+          const sortedExpected = [...expected].sort()
+
+          if (JSON.stringify(actual) !== JSON.stringify(sortedExpected)) {
+            console.error({ expected: sortedExpected, actual })
+            process.exit(1)
+          }
+
+          const plugin = await import("./dist/src/index.js")
+          if (!plugin.default) throw new Error("package entrypoint has no default export")
+          console.log(`validated ${actual.length} package files and the plugin entrypoint`)
+          NODE

@@ -1,5 +1,7 @@
 # opencode-ssh
 
+[![CI](https://github.com/bedasrv/opencode-ssh/actions/workflows/ci.yml/badge.svg)](https://github.com/bedasrv/opencode-ssh/actions/workflows/ci.yml)
+
 An OpenCode v2 plugin that runs shell commands through a persistent SSH ControlMaster. It uses SSH host aliases from `~/.ssh/config`; OpenCode itself does not need to be installed on the remote host.
 
 ## Install
@@ -45,6 +47,21 @@ Host myHost
 ```
 
 Ensure the public key is in the remote user's `~/.ssh/authorized_keys` and verify `ssh myHost` works before using the plugin.
+
+## Development and releases
+
+Install the locked dependencies and run the same checks used by GitHub Actions:
+
+```sh
+npm ci
+npm run typecheck
+npm test
+npm run build
+```
+
+CI runs on pushes and pull requests targeting `master` across Node.js 20 and 22. It also verifies that the checked-in `dist/src` artifacts are reproducible and that the npm package contains only the intended runtime files.
+
+The release workflow publishes a tagged package after the full CI workflow passes. To publish, configure an `NPM_TOKEN` GitHub Actions secret for the repository, then push a tag matching the version in `package.json`, for example `v2.0.0`.
 
 ## Files
 
