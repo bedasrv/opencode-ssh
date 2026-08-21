@@ -33,11 +33,11 @@ Ask the model to connect to an alias, for example:
 Connect to myHost
 ```
 
-The model calls `ssh_connect`. After connection, the v2 shell tool hook rewrites every shell command using that OpenCode session's persistent ControlMaster. This is not dependent on prompt instructions. Remote commands start in the SSH login shell's working directory; the plugin does not preserve OpenCode's local cwd. Use `ssh_disconnect` or ask to return local to close it.
+The model calls `ssh_connect`. After connection, the v2 shell tool hook rewrites every shell command using that OpenCode session's persistent ControlMaster. This is not dependent on prompt instructions. Remote commands start in the SSH login shell's working directory; OpenCode's local workdir is stripped from remote shell calls rather than translated to a remote `cd`. Use `ssh_disconnect` or ask to return local to close it.
 
 ## SSH setup
 
-Use an SSH key or an SSH agent. Password prompts and `sshpass` are intentionally unsupported.
+Use an SSH key or an SSH agent. Password prompts and `sshpass` are intentionally unsupported; master startup uses `BatchMode=yes`, so a missing key or passphrase fails fast instead of hanging.
 
 ```sshconfig
 Host myHost
@@ -65,9 +65,9 @@ The release workflow publishes a tagged package after the full CI workflow passe
 
 ## Files
 
-Shell file commands such as `cat`, `tee`, `find`, and remote `grep` run on the server. OpenCode's local `read`, `edit`, `glob`, and `grep` tools are removed from the session context while remote mode is active, preventing accidental local edits or searches. Disconnect to restore local tools.
+Shell file commands such as `cat`, `tee`, `find`, and remote `grep` run on the server. OpenCode's local `read`, `write`, `edit`, `patch`, `glob`, and `grep` tools are removed from the session context while remote mode is active, preventing accidental local edits or searches; a stale tool list captured before connecting is also rejected if it attempts `write` or `patch` mid-turn. Disconnect to restore local tools.
 
-Control sockets are kept in a private `~/.ssh/opencode-ssh` directory with mode `0700`, use collision-resistant names, and are removed when a session disconnects or the plugin is cleaned up. Stale sockets are discarded and healthy masters are reused.
+Control sockets are kept in a private `~/.ssh/opencode-ssh` directory whose `0700` mode is enforced on every connect (symlinked socket directories are refused). Socket names are collision-resistant, and sockets are removed when a session disconnects or the plugin is cleaned up. Deleting an OpenCode session disconnects it as well. Stale sockets are discarded and healthy masters are reused.
 
 ## Troubleshooting
 
