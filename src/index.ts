@@ -30,6 +30,62 @@ const input = {
   additionalProperties: false,
 } as const
 
+const output = {
+  type: "object",
+  properties: {},
+  additionalProperties: false,
+} as const
+
+/**
+ * Builds the ssh_connect/ssh_disconnect tool registrations. Both are declared
+ * with `options: { codemode: false }` so OpenCode registers them as first-class
+ * direct tools instead of Code-Mode-only tools, whose bridge drops plugin tool
+ * results (the model would only ever see "Tool execution failed"). Direct tools
+ * must return `{ title?, output, metadata? }` objects and surface failures by
+ * throwing, which reaches the model as a real error message.
+ */
+export function sshToolRegistrations(connections: SshConnections) {
+  return [
+    {
+      name: "ssh_connect",
+      description:
+        "Connect to an SSH host alias from ~/.ssh/config. First-class tool: call it directly, not through execute.",
+      input,
+      output,
+      options: { codemode: false },
+      async execute(args: unknown, toolCtx: { sessionID: string }) {
+        const host = (args as { host: string }).host
+        try {
+          const state = await connections.connect(toolCtx.sessionID, host)
+          return {
+            title: "ssh_connect",
+            output: `Connected to ${state.host}. Shell commands now run remotely. Use ssh_disconnect to return local.`,
+            metadata: { host: state.host },
+          }
+        } catch (error) {
+          throw new Error(error instanceof Error ? error.message : String(error))
+        }
+      },
+    },
+    {
+      name: "ssh_disconnect",
+      description:
+        "Disconnect the current SSH session and return to local mode. First-class tool: call it directly, not through execute.",
+      input: { type: "object", properties: {}, additionalProperties: false },
+      output,
+      options: { codemode: false },
+      async execute(_args: unknown, toolCtx: { sessionID: string }) {
+        await connections.disconnect(toolCtx.sessionID)
+        return {
+          title: "ssh_disconnect",
+          output: "Disconnected. Shell commands now run locally.",
+          metadata: {},
+        }
+      },
+    },
+  ]
+}
+
 const isInputObject = (value: unknown): value is object => typeof value === "object" && value !== null
 
 export default Plugin.define({
@@ -48,28 +104,7 @@ export default Plugin.define({
     const countedShells = new WeakSet<object>()
 
     await ctx.tool.transform((draft) => {
-      draft.add({
-        name: "ssh_connect",
-        description: "Connect to an SSH host alias from ~/.ssh/config.",
-        input,
-        async execute(args, toolCtx) {
-          try {
-            const state = await connections.connect(toolCtx.sessionID, (args as { host: string }).host)
-            return { output: `Connected to ${state.host}. Shell commands now run remotely. Use ssh_disconnect to return local.` }
-          } catch (error) {
-            return { output: error instanceof Error ? error.message : String(error) }
-          }
-        },
-      })
-      draft.add({
-        name: "ssh_disconnect",
-        description: "Disconnect the current SSH session and return to local mode.",
-        input: { type: "object", properties: {}, additionalProperties: false },
-        async execute(_args, toolCtx) {
-          await connections.disconnect(toolCtx.sessionID)
-          return { output: "Disconnected. Shell commands now run locally." }
-        },
-      })
+      for (const tool of sshToolRegistrations(connections)) draft.add(tool)
     })
 
     await ctx.tool.hook("execute.before", (event) => {

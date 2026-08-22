@@ -25,6 +25,7 @@ export type FileOps = {
 export type ConnectionState = {
     host: string;
     socketPath: string;
+    configPath?: string;
 };
 /** Local workspace tools disabled while an SSH session owns the shell. */
 export declare const LOCAL_WORKSPACE_TOOLS: readonly ["read", "write", "edit", "patch", "glob", "grep"];
@@ -36,8 +37,12 @@ export type ShellExecuteBeforeEvent = {
 export declare function quotePosix(value: string): string;
 export declare function socketPath(home: string, sessionID: string, host: string): string;
 export declare function validateHost(host: string): void;
-/** Always POSIX-quotes the complete command as one SSH argument. Never trusts prefixes. */
-export declare function wrapRemoteCommand(socket: string, host: string, command: string): string;
+/**
+ * Always POSIX-quotes the complete command as one SSH argument. Never trusts prefixes.
+ * When configPath is set it pins the per-user ssh config with -F so an overridden
+ * HOME cannot make OpenSSH silently fall back to a different config file.
+ */
+export declare function wrapRemoteCommand(socket: string, host: string, command: string, configPath?: string): string;
 /**
  * Rewrites tool executions for sessions in remote mode:
  * - shell: idempotently wraps the command through the session's ControlMaster and
@@ -96,6 +101,8 @@ export declare class SshConnections {
     private runExclusive;
     connect(sessionID: string, host: string): Promise<ConnectionState>;
     private connectUnlocked;
+    /** Prepends -F so OpenSSH uses the pinned per-user config instead of resolving one from the process HOME. */
+    private sshArgs;
     disconnect(sessionID: string): Promise<void>;
     private disconnectUnlocked;
     /** Best-effort bounded wait for in-flight remote shells so masters are not stopped underneath them. */

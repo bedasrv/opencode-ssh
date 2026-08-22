@@ -33,11 +33,11 @@ Ask the model to connect to an alias, for example:
 Connect to myHost
 ```
 
-The model calls `ssh_connect`. After connection, the v2 shell tool hook rewrites every shell command using that OpenCode session's persistent ControlMaster. This is not dependent on prompt instructions. Remote commands start in the SSH login shell's working directory; OpenCode's local workdir is stripped from remote shell calls rather than translated to a remote `cd`. Use `ssh_disconnect` or ask to return local to close it.
+The model calls `ssh_connect`. Both `ssh_connect` and `ssh_disconnect` are first-class direct tools (`options.codemode: false` with a declared output schema), so call them directly — not through Code Mode `execute`. They return structured results, and failures surface as tool errors carrying the real error message instead of a generic "Tool execution failed". After connection, the v2 shell tool hook rewrites every shell command using that OpenCode session's persistent ControlMaster. This is not dependent on prompt instructions. Remote commands start in the SSH login shell's working directory; OpenCode's local workdir is stripped from remote shell calls rather than translated to a remote `cd`. Use `ssh_disconnect` or ask to return local to close it.
 
 ## SSH setup
 
-Use an SSH key or an SSH agent. Password prompts and `sshpass` are intentionally unsupported; master startup uses `BatchMode=yes`, so a missing key or passphrase fails fast instead of hanging.
+Use an SSH key or an SSH agent. Password prompts and `sshpass` are intentionally unsupported; master startup uses `BatchMode=yes`, so a missing key or passphrase fails fast instead of hanging. Every `ssh` invocation passes `-F ~/.ssh/config` explicitly when that file exists, so an overridden process `HOME` cannot silently switch OpenSSH to a different config.
 
 ```sshconfig
 Host myHost

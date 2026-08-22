@@ -16,7 +16,7 @@ export type FileOps = {
   lstat(path: string): Promise<FileInfo>
 }
 
-export type ConnectionState = { host: string; socketPath: string }
+export type ConnectionState = { host: string; socketPath: string; configPath?: string }
 
 /** Local workspace tools disabled while an SSH session owns the shell. */
 export const LOCAL_WORKSPACE_TOOLS = ["read", "write", "edit", "patch", "glob", "grep"] as const
@@ -42,16 +42,21 @@ export function validateHost(host: string): void {
   }
 }
 
-/** Always POSIX-quotes the complete command as one SSH argument. Never trusts prefixes. */
-export function wrapRemoteCommand(socket: string, host: string, command: string): string {
-  return `ssh -S ${quotePosix(socket)} ${quotePosix(host)} ${quotePosix(command)}`
+/**
+ * Always POSIX-quotes the complete command as one SSH argument. Never trusts prefixes.
+ * When configPath is set it pins the per-user ssh config with -F so an overridden
+ * HOME cannot make OpenSSH silently fall back to a different config file.
+ */
+export function wrapRemoteCommand(socket: string, host: string, command: string, configPath?: string): string {
+  const config = configPath ? `-F ${quotePosix(configPath)} ` : ""
+  return `ssh ${config}-S ${quotePosix(socket)} ${quotePosix(host)} ${quotePosix(command)}`
 }
 
 function remotePolicyError(tool: string, host: string): Error {
   return new Error(`Tool "${tool}" is unavailable while remote SSH mode is active for ${host}. Use ssh_disconnect to restore local tools.`)
 }
 
-type WrapRecord = { original: string; wrapped: string; socket: string; host: string }
+type WrapRecord = { original: string; wrapped: string; socket: string; host: string; configPath?: string }
 const wrapRecords = new WeakMap<object, WrapRecord>()
 
 /**
@@ -84,13 +89,18 @@ export function transformShellExecuteBefore(
 
   const record = wrapRecords.get(event.input)
   if (!record) {
-    const wrapped = wrapRemoteCommand(state.socketPath, state.host, input.command)
-    wrapRecords.set(event.input, { original: input.command, wrapped, socket: state.socketPath, host: state.host })
+    const wrapped = wrapRemoteCommand(state.socketPath, state.host, input.command, state.configPath)
+    wrapRecords.set(event.input, { original: input.command, wrapped, socket: state.socketPath, host: state.host, configPath: state.configPath })
     input.command = wrapped
     return true
   }
 
-  if (input.command === record.wrapped && record.socket === state.socketPath && record.host === state.host) {
+  if (
+    input.command === record.wrapped &&
+    record.socket === state.socketPath &&
+    record.host === state.host &&
+    record.configPath === state.configPath
+  ) {
     return true // unchanged repeat: already wrapped for this exact connection
   }
 
@@ -98,8 +108,8 @@ export function transformShellExecuteBefore(
   // payload) or the connection changed (rewind to the original user command);
   // either way rewrap fresh instead of nesting stale state.
   const source = input.command === record.wrapped ? record.original : input.command
-  const wrapped = wrapRemoteCommand(state.socketPath, state.host, source)
-  wrapRecords.set(event.input, { original: source, wrapped, socket: state.socketPath, host: state.host })
+  const wrapped = wrapRemoteCommand(state.socketPath, state.host, source, state.configPath)
+  wrapRecords.set(event.input, { original: source, wrapped, socket: state.socketPath, host: state.host, configPath: state.configPath })
   input.command = wrapped
   return true
 }
@@ -240,7 +250,7 @@ export class SshConnections {
     const existing = this.states.get(sessionID)
     if (existing?.host === host) {
       try {
-        await this.options.runner.run("ssh", ["-O", "check", "-S", existing.socketPath, host], { timeout: 5000 })
+        await this.options.runner.run("ssh", this.sshArgs(["-O", "check", "-S", existing.socketPath, host], existing.configPath), { timeout: 5000 })
         return existing
       } catch {
         await this.disconnectUnlocked(sessionID)
@@ -250,6 +260,8 @@ export class SshConnections {
     }
     const socket = socketPath(this.options.home, sessionID, host)
     const dir = join(this.options.home, ".ssh", "opencode-ssh")
+    const userConfig = join(this.options.home, ".ssh", "config")
+    const configPath = (await this.options.fs.exists(userConfig)) ? userConfig : undefined
     await this.options.fs.mkdir(dir, { recursive: true, mode: 0o700 })
     const info = await this.options.fs.lstat(dir)
     if (info.isSymbolicLink()) {
@@ -259,22 +271,27 @@ export class SshConnections {
     try {
       if (await this.options.fs.exists(socket)) {
         try {
-          await this.options.runner.run("ssh", ["-O", "check", "-S", socket, host], { timeout: 5000 })
-          const state = { host, socketPath: socket }
+          await this.options.runner.run("ssh", this.sshArgs(["-O", "check", "-S", socket, host], configPath), { timeout: 5000 })
+          const state = { host, socketPath: socket, configPath }
           this.states.set(sessionID, state)
           return state
         } catch {
           await this.options.fs.rm(socket, { force: true })
         }
       }
-      await this.options.runner.run("ssh", ["-MNf", "-o", "BatchMode=yes", "-S", socket, host], { timeout: 15000 })
-      const state = { host, socketPath: socket }
+      await this.options.runner.run("ssh", this.sshArgs(["-MNf", "-o", "BatchMode=yes", "-S", socket, host], configPath), { timeout: 15000 })
+      const state = { host, socketPath: socket, configPath }
       this.states.set(sessionID, state)
       return state
     } catch (error) {
       await this.options.fs.rm(socket, { force: true }).catch(() => {})
       throw new Error(`Failed to connect to ${host}: ${describeError(error)}`)
     }
+  }
+
+  /** Prepends -F so OpenSSH uses the pinned per-user config instead of resolving one from the process HOME. */
+  private sshArgs(args: string[], configPath?: string): string[] {
+    return configPath ? ["-F", configPath, ...args] : args
   }
 
   disconnect(sessionID: string): Promise<void> {
@@ -290,7 +307,7 @@ export class SshConnections {
     this.disconnecting.add(sessionID)
     try {
       await this.awaitQuietShells()
-      try { await this.options.runner.run("ssh", ["-O", "stop", "-S", state.socketPath, state.host], { timeout: 5000 }) } catch {}
+      try { await this.options.runner.run("ssh", this.sshArgs(["-O", "stop", "-S", state.socketPath, state.host], state.configPath), { timeout: 5000 }) } catch {}
       await this.options.fs.rm(state.socketPath, { force: true }).catch(() => {})
     } finally {
       this.disconnecting.delete(sessionID)

@@ -1,5 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { sshToolRegistrations } from "../src/index.js"
 import {
   LOCAL_WORKSPACE_TOOLS,
   applyRemoteContext,
@@ -14,7 +15,7 @@ import {
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
-type StateMap = Map<string, { host: string; socketPath: string }>
+type StateMap = Map<string, { host: string; socketPath: string; configPath?: string }>
 const stateGetter = (states: StateMap) => (sessionID: string) => states.get(sessionID)
 
 const shellEvent = (sessionID: string, command: string, extra: Record<string, unknown> = {}): {
@@ -297,6 +298,38 @@ test("enforces socket directory permissions and refuses symlinked directories", 
   await assert.rejects(() => bad.connect("one", "alpha"), /symlink/i)
 })
 
+test("wrapRemoteCommand pins an explicit config with -F only when one is provided", () => {
+  assert.equal(wrapRemoteCommand("/tmp/cm.sock", "my-host", "pwd"), "ssh -S '/tmp/cm.sock' 'my-host' 'pwd'")
+  assert.equal(
+    wrapRemoteCommand("/tmp/cm.sock", "my-host", "echo 'hi'", "/home/test/.ssh/config"),
+    "ssh -F '/home/test/.ssh/config' -S '/tmp/cm.sock' 'my-host' 'echo '\\''hi'\\'''",
+  )
+  assert.equal(
+    wrapRemoteCommand("/s", "h", "c", "/odd 'dir/cfg"),
+    "ssh -F '/odd '\\''dir/cfg' -S '/s' 'h' 'c'",
+  )
+})
+
+test("transformShellExecuteBefore wraps through the pinned config and stays idempotent", () => {
+  const states: StateMap = new Map([["one", { socketPath: "/tmp/one.sock", host: "alpha", configPath: "/cfg" }]])
+  const event = shellEvent("one", "pwd")
+  assert.equal(transformShellExecuteBefore(event, stateGetter(states)), true)
+  const wrapped = "ssh -F '/cfg' -S '/tmp/one.sock' 'alpha' 'pwd'"
+  assert.equal(event.input.command, wrapped)
+  assert.equal(transformShellExecuteBefore(event, stateGetter(states)), true)
+  assert.equal(event.input.command, wrapped)
+})
+
+test("a changed pinned config rewinds to the original command instead of nesting -F flags", () => {
+  const state = { socketPath: "/tmp/one.sock", host: "alpha", configPath: "/cfg-a" }
+  const states: StateMap = new Map([["one", state]])
+  const event = shellEvent("one", "pwd")
+  transformShellExecuteBefore(event, stateGetter(states))
+  state.configPath = "/cfg-b"
+  transformShellExecuteBefore(event, stateGetter(states))
+  assert.equal(event.input.command, "ssh -F '/cfg-b' -S '/tmp/one.sock' 'alpha' 'pwd'")
+})
+
 test("starts masters with BatchMode=yes so prompts fail fast", async () => {
   const runner = new FakeRunner()
   const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(new Set()) })
@@ -304,6 +337,41 @@ test("starts masters with BatchMode=yes so prompts fail fast", async () => {
   const start = runner.calls.find((call) => call.args[0] === "-MNf")
   assert.ok(start)
   assert.deepEqual(start.args.slice(0, 4), ["-MNf", "-o", "BatchMode=yes", "-S"])
+})
+
+test("every ssh invocation pins <home>/.ssh/config with -F whenever it exists", async () => {
+  const runner = new FakeRunner()
+  const files = new Set<string>(["/home/test/.ssh/config"])
+  const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(files) })
+
+  const state = await connections.connect("one", "alpha")
+  assert.equal(state.configPath, "/home/test/.ssh/config")
+  await connections.connect("one", "alpha") // exercises the -O check reuse path
+  await connections.disconnect("one")
+
+  const sshCalls = runner.calls.filter((call) => call.file === "ssh")
+  assert.ok(sshCalls.length >= 3)
+  assert.ok(sshCalls.some((call) => call.args.includes("-MNf")))
+  assert.ok(sshCalls.some((call) => call.args.includes("-O")))
+  for (const call of sshCalls) {
+    assert.deepEqual(call.args.slice(0, 2), ["-F", "/home/test/.ssh/config"], JSON.stringify(call.args))
+  }
+})
+
+test("without ~/.ssh/config, ssh invocations keep the default layout and no -F", async () => {
+  const runner = new FakeRunner()
+  const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(new Set()) })
+
+  const state = await connections.connect("one", "alpha")
+  assert.equal(state.configPath, undefined)
+  await connections.disconnect("one")
+
+  const sshCalls = runner.calls.filter((call) => call.file === "ssh")
+  assert.ok(sshCalls.length >= 2)
+  const start = sshCalls.find((call) => call.args[0] === "-MNf")
+  assert.ok(start)
+  assert.deepEqual(start.args.slice(0, 4), ["-MNf", "-o", "BatchMode=yes", "-S"])
+  for (const call of sshCalls) assert.notEqual(call.args[0], "-F")
 })
 
 test("connects made after cleanup begins reject as shutting down", async () => {
@@ -487,4 +555,49 @@ test("unexpected stream failures are reported without crashing; aborts stay quie
   } finally {
     console.warn = original
   }
+})
+
+test("registers ssh tools as first-class direct tools with output schemas", () => {
+  const connections = new SshConnections({ home: "/home/test", runner: new FakeRunner(), fs: memoryFs(new Set()) })
+  const [connect, disconnect] = sshToolRegistrations(connections)
+
+  assert.equal(connect.name, "ssh_connect")
+  assert.equal(disconnect.name, "ssh_disconnect")
+  assert.equal(connect.options?.codemode, false)
+  assert.equal(disconnect.options?.codemode, false)
+  assert.equal(connect.output?.type, "object")
+  assert.equal(disconnect.output?.type, "object")
+})
+
+test("ssh_connect resolves a direct-tool result and throws real errors", async () => {
+  const good = new SshConnections({ home: "/home/test", runner: new FakeRunner(), fs: memoryFs(new Set()) })
+  const [connect] = sshToolRegistrations(good)
+
+  const result = await connect.execute({ host: "alpha" }, { sessionID: "one" })
+  assert.equal(result.title, "ssh_connect")
+  assert.match(result.output, /^Connected to alpha\./)
+  assert.deepEqual(result.metadata, { host: "alpha" })
+
+  const badRunner: ProcessRunner = {
+    async run(_file, args) {
+      if (args[0] === "-MNf") throw Object.assign(new Error("Command failed"), { stderr: "permission denied\n" })
+      return { stdout: "", stderr: "", code: 0 }
+    },
+  }
+  const bad = new SshConnections({ home: "/home/test", runner: badRunner, fs: memoryFs(new Set()) })
+  const [badConnect] = sshToolRegistrations(bad)
+  await assert.rejects(() => badConnect.execute({ host: "alpha" }, { sessionID: "one" }), /permission denied/)
+})
+
+test("ssh_disconnect returns a direct-tool result and clears the session", async () => {
+  const connections = new SshConnections({ home: "/home/test", runner: new FakeRunner(), fs: memoryFs(new Set()) })
+  const [, disconnect] = sshToolRegistrations(connections)
+  await connections.connect("one", "alpha")
+
+  const result = await disconnect.execute({}, { sessionID: "one" })
+
+  assert.equal(result.title, "ssh_disconnect")
+  assert.equal(result.output, "Disconnected. Shell commands now run locally.")
+  assert.deepEqual(result.metadata, {})
+  assert.equal(connections.get("one"), undefined)
 })
