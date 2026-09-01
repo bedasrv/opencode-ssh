@@ -1,7 +1,7 @@
 {
   "name": "opencode-ssh",
   "version": "2.0.1",
-  "description": "OpenCode v2 plugin for persistent SSH remote shell sessions",
+  "description": "OpenCode plugin for persistent SSH shell sessions and SSHFS workspaces",
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",

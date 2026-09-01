@@ -108,6 +108,8 @@ jobs:
             "package.json",
             "dist/src/pty-helper.d.ts",
             "dist/src/pty-helper.js",
+            "dist/src/workspace.d.ts",
+            "dist/src/workspace.js",
           ]
           const actual = pack.files.map(({ path }) => path).sort()
           const sortedExpected = [...expected].sort()

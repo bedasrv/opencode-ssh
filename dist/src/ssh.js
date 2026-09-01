@@ -15,19 +15,33 @@ export function validateHost(host) {
         throw new Error(`Invalid SSH host: ${host}`);
     }
 }
+export function validateRemoteCwd(cwd) {
+    if (!cwd.startsWith("/") || /[\x00-\x1f\x7f]/.test(cwd) || cwd.split("/").some((part) => part === ".."))
+        throw new Error("Invalid remote workspace directory");
+}
 /**
  * Always POSIX-quotes the complete command as one SSH argument. Never trusts prefixes.
  * When configPath is set it pins the per-user ssh config with -F so an overridden
  * HOME cannot make OpenSSH silently fall back to a different config file.
  */
-export function wrapRemoteCommand(socket, host, command, configPath) {
+export function wrapRemoteCommand(socket, host, command, configPath, remoteCwd) {
     const config = configPath ? `-F ${quotePosix(configPath)} ` : "";
-    return `ssh ${config}-S ${quotePosix(socket)} ${quotePosix(host)} ${quotePosix(command)}`;
+    const cwd = remoteCwd ? `cd -- ${quotePosix(remoteCwd)} && ${command}` : command;
+    return `ssh ${config}-S ${quotePosix(socket)} ${quotePosix(host)} ${quotePosix(cwd)}`;
 }
 function remotePolicyError(tool, host) {
     return new Error(`Tool "${tool}" is unavailable while remote SSH mode is active for ${host}. Use ssh_disconnect to restore local tools.`);
 }
 const wrapRecords = new WeakMap();
+function translateWorkspaceCommand(command, localDirectory, remotePath) {
+    if (!localDirectory || !remotePath)
+        return command;
+    const localRoot = localDirectory.length > 1 && localDirectory.endsWith("/") ? localDirectory.slice(0, -1) : localDirectory;
+    if (localRoot === "/")
+        return command;
+    const escaped = localRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return command.replace(new RegExp(`${escaped}(?=$|/)`, "g"), remotePath);
+}
 /**
  * Rewrites tool executions for sessions in remote mode:
  * - shell/bash: idempotently wraps the command through the session's ControlMaster and
@@ -43,7 +57,7 @@ export function transformShellExecuteBefore(event, getState) {
     if (!state)
         return false;
     if (event.tool !== "shell" && event.tool !== "bash") {
-        if (LOCAL_WORKSPACE_TOOLS.includes(event.tool)) {
+        if (LOCAL_WORKSPACE_TOOLS.includes(event.tool) && state.mode !== "workspace") {
             throw remotePolicyError(event.tool, state.host);
         }
         return false;
@@ -55,28 +69,34 @@ export function transformShellExecuteBefore(event, getState) {
         return false;
     const record = wrapRecords.get(event.input);
     if (!record) {
-        const wrapped = wrapRemoteCommand(state.socketPath, state.host, input.command, state.configPath);
-        wrapRecords.set(event.input, { original: input.command, wrapped, socket: state.socketPath, host: state.host, configPath: state.configPath });
+        const original = input.command;
+        const command = state.mode === "workspace" ? translateWorkspaceCommand(original, state.localDirectory, state.remotePath) : original;
+        const wrapped = wrapRemoteCommand(state.socketPath, state.host, command, state.configPath, state.mode === "workspace" ? state.remotePath : undefined);
+        wrapRecords.set(event.input, { original, wrapped, socket: state.socketPath, host: state.host, configPath: state.configPath, remoteCwd: state.remotePath });
         input.command = wrapped;
         return true;
     }
     if (input.command === record.wrapped &&
         record.socket === state.socketPath &&
         record.host === state.host &&
-        record.configPath === state.configPath) {
+        record.configPath === state.configPath && record.remoteCwd === state.remotePath) {
         return true; // unchanged repeat: already wrapped for this exact connection
     }
     // Either another hook changed the command (take the current text as the new
     // payload) or the connection changed (rewind to the original user command);
     // either way rewrap fresh instead of nesting stale state.
     const source = input.command === record.wrapped ? record.original : input.command;
-    const wrapped = wrapRemoteCommand(state.socketPath, state.host, source, state.configPath);
-    wrapRecords.set(event.input, { original: source, wrapped, socket: state.socketPath, host: state.host, configPath: state.configPath });
+    const command = state.mode === "workspace" ? translateWorkspaceCommand(source, state.localDirectory, state.remotePath) : source;
+    const wrapped = wrapRemoteCommand(state.socketPath, state.host, command, state.configPath, state.mode === "workspace" ? state.remotePath : undefined);
+    wrapRecords.set(event.input, { original: source, wrapped, socket: state.socketPath, host: state.host, configPath: state.configPath, remoteCwd: state.remotePath });
     input.command = wrapped;
     return true;
 }
 export function remoteSystemMessage(host) {
     return `Remote SSH mode is active for ${host}. Shell commands run remotely and ignore OpenCode's local workdir. Local workspace tools are unavailable until you use ssh_disconnect. Do not add SSH yourself.`;
+}
+export function workspaceSystemMessage(host, remotePath) {
+    return `SSHFS workspace mode is active for ${host}:${remotePath}. Normal file tools operate on the local SSHFS mount; shell commands execute remotely in the matching remote directory.`;
 }
 /** Applies the remote policy to a session context; safe to call repeatedly. */
 export function applyRemoteContext(context, host) {
@@ -197,7 +217,42 @@ export class SshConnections {
             // for the whole drain window before learning shutdown has begun.
             return Promise.reject(new Error("opencode-ssh is shutting down; start a new session to reconnect"));
         }
-        return this.runExclusive(sessionID, () => this.connectUnlocked(sessionID, host));
+        return this.runExclusive(sessionID, async () => {
+            if (this.states.get(sessionID)?.mode === "workspace")
+                await this.disconnectUnlocked(sessionID);
+            const state = await this.connectUnlocked(sessionID, host);
+            state.mode = "shell";
+            delete state.remotePath;
+            delete state.localDirectory;
+            return state;
+        });
+    }
+    connectWorkspace(sessionID, host, remotePath, localDirectory) {
+        if (this.closing)
+            return Promise.reject(new Error("opencode-ssh is shutting down; start a new session to reconnect"));
+        validateHost(host);
+        validateRemoteCwd(remotePath);
+        return this.runExclusive(sessionID, async () => {
+            const existing = this.states.get(sessionID);
+            if (existing?.mode === "workspace" && existing.host === host) {
+                try {
+                    await this.options.runner.run("ssh", this.sshArgs(["-O", "check", "-S", existing.socketPath, host], existing.configPath), { timeout: 5000 });
+                    existing.remotePath = remotePath;
+                    existing.localDirectory = localDirectory;
+                    return existing;
+                }
+                catch {
+                    await this.disconnectUnlocked(sessionID);
+                }
+            }
+            else if (existing)
+                await this.disconnectUnlocked(sessionID);
+            const state = await this.connectUnlocked(sessionID, host);
+            state.mode = "workspace";
+            state.remotePath = remotePath;
+            state.localDirectory = localDirectory;
+            return state;
+        });
     }
     async connectUnlocked(sessionID, host) {
         validateHost(host);
@@ -236,7 +291,7 @@ export class SshConnections {
                     await this.options.fs.rm(socket, { force: true });
                 }
             }
-            await this.options.runner.run("ssh", this.sshArgs(["-MNf", "-o", "BatchMode=yes", "-S", socket, host], configPath), { timeout: 15000 });
+            await this.options.runner.run("ssh", this.sshArgs(["-MNf", "-o", "BatchMode=yes", "-S", socket, host], configPath), { timeout: 15000, stdio: "ignore" });
             const state = { host, socketPath: socket, configPath };
             this.states.set(sessionID, state);
             return state;

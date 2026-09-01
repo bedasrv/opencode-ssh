@@ -1,11 +1,15 @@
 export type ProcessRunner = {
     run(file: string, args: string[], options?: {
         timeout?: number;
+        stdio?: "pipe" | "ignore";
     }): Promise<{
         stdout: string;
         stderr: string;
         code: number;
     }>;
+    start?(file: string, args: string[], options?: {
+        timeout?: number;
+    }): Promise<unknown>;
 };
 export type FileInfo = {
     isSymbolicLink(): boolean;
@@ -26,6 +30,9 @@ export type ConnectionState = {
     host: string;
     socketPath: string;
     configPath?: string;
+    mode?: "shell" | "workspace";
+    remotePath?: string;
+    localDirectory?: string;
 };
 /** Local workspace tools disabled while an SSH session owns the shell. */
 export declare const LOCAL_WORKSPACE_TOOLS: readonly ["read", "write", "edit", "patch", "apply_patch", "glob", "grep"];
@@ -37,12 +44,13 @@ export type ShellExecuteBeforeEvent = {
 export declare function quotePosix(value: string): string;
 export declare function socketPath(home: string, sessionID: string, host: string): string;
 export declare function validateHost(host: string): void;
+export declare function validateRemoteCwd(cwd: string): void;
 /**
  * Always POSIX-quotes the complete command as one SSH argument. Never trusts prefixes.
  * When configPath is set it pins the per-user ssh config with -F so an overridden
  * HOME cannot make OpenSSH silently fall back to a different config file.
  */
-export declare function wrapRemoteCommand(socket: string, host: string, command: string, configPath?: string): string;
+export declare function wrapRemoteCommand(socket: string, host: string, command: string, configPath?: string, remoteCwd?: string): string;
 /**
  * Rewrites tool executions for sessions in remote mode:
  * - shell/bash: idempotently wraps the command through the session's ControlMaster and
@@ -53,6 +61,7 @@ export declare function wrapRemoteCommand(socket: string, host: string, command:
  */
 export declare function transformShellExecuteBefore(event: ShellExecuteBeforeEvent, getState: (sessionID: string) => ConnectionState | undefined): boolean;
 export declare function remoteSystemMessage(host: string): string;
+export declare function workspaceSystemMessage(host: string, remotePath: string): string;
 type RemoteContextLike = {
     tools: Record<string, unknown>;
     system: Array<{
@@ -100,6 +109,7 @@ export declare class SshConnections {
     /** Serializes per-session async operations so connect/disconnect cannot interleave. */
     private runExclusive;
     connect(sessionID: string, host: string): Promise<ConnectionState>;
+    connectWorkspace(sessionID: string, host: string, remotePath: string, localDirectory: string): Promise<ConnectionState>;
     private connectUnlocked;
     /** Prepends -F so OpenSSH uses the pinned per-user config instead of resolving one from the process HOME. */
     private sshArgs;

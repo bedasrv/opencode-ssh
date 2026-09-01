@@ -41,6 +41,18 @@ Use `ssh_channel_open` with a validated SSH alias to create a persistent interac
 
 ## SSH setup
 
+### SSHFS workspaces (certified legacy `server()` mode)
+
+The legacy plugin also provides an `sshfs` workspace adapter. The local machine must have `sshfs`, FUSE, and the OpenSSH `sftp` client available; the plugin never installs these prerequisites. Configure a final-host OpenSSH alias in `~/.ssh/config` (including any `ProxyJump` there) and use an absolute POSIX project path on that host. Workspace metadata accepts the alias and path only—no `user@host`, passwords, private keys, or inline hop strings.
+
+When OpenCode creates the workspace, the adapter performs a non-mutating SFTP directory preflight, allocates a private plugin-owned local mount under the user's cache, starts SSHFS through the configured alias with `BatchMode=yes` and no password prompts, verifies the mount, and returns that private mount as the OpenCode local workspace target. Normal `read`, `write`, `edit`, `glob`, `grep`, VCS, and LSP operations therefore use the mounted directory. The original local project directory is not mounted over.
+
+For a ready SSHFS mount, `shell` and legacy `bash` commands are routed through a per-session SSH ControlMaster and run in the matching final-host remote directory. The mount root and safe descendants map to corresponding remote paths; paths outside the managed mount, removed mounts, failed preflights, and unverified mounts fail closed rather than falling back to local execution. Workspace mode does not disable local filesystem tools. The explicit `ssh_connect`/`ssh_disconnect` mode remains separate and shell-only: it routes shell commands remotely but rejects local workspace tools as before.
+
+Telnet, serial, console, `picocom`, and other PTY-only endpoints are not filesystem workspaces and cannot be offered to SSHFS. Use the persistent channel tools for those endpoints. SSHFS workspace cleanup is owner-scoped: disposal and workspace removal unmount the tracked mount, terminate and await the owned SSHFS process, and remove only private local state. Unmount or verification errors remain fail-closed and may require retry; the plugin does not claim that a live SSHFS mount has been run on every host.
+
+OpenCode remains installed and runs locally; no OpenCode process is started on the final SSH host. The certified workspace registration is on the legacy `server()` surface. The native promise `setupV2()` export remains available only for runtimes exposing its tested custom-tool API and does not claim native workspace registration when that root workspace API is unavailable.
+
 Use an SSH key or an SSH agent. Password prompts and `sshpass` are intentionally unsupported; master startup uses `BatchMode=yes`, so a missing key or passphrase fails fast instead of hanging. Every `ssh` invocation passes `-F ~/.ssh/config` explicitly when that file exists, so an overridden process `HOME` cannot silently switch OpenSSH to a different config.
 
 Interactive channels use the plugin-owned `node-pty` process transport. The child receives a minimal environment containing the configured home, PATH, terminal type, SSH agent socket, and locale values; unrelated OpenCode service variables are not inherited. PTY state is process-local and is intentionally not recovered after plugin restart.

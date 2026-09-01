@@ -2,7 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
-import plugin, { setupV2, applyV2SessionContext, sshToolRegistrations, sshChannelToolRegistrations } from "../src/index.js"
+import plugin, { setupV2, applyV2SessionContext, prepareWorkspaceShell, sshToolRegistrations, sshChannelToolRegistrations } from "../src/index.js"
 import * as pluginNamespace from "../src/index.js"
 import {
   LOCAL_WORKSPACE_TOOLS,
@@ -10,12 +10,14 @@ import {
   consumeSessionDeletions,
   quotePosix,
   transformShellExecuteBefore,
+  workspaceSystemMessage,
   validateHost,
   wrapRemoteCommand,
   SshConnections,
   type ProcessRunner,
 } from "../src/ssh.js"
 import { SshChannelManager, createLocalPtyTransport, interactiveSshArgs, MAX_INPUT } from "../src/channel.js"
+import { createSessionWorkspaceAssociations } from "../src/workspace.js"
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
@@ -487,6 +489,183 @@ test("applyRemoteContext removes workspace tools, keeps others, and posts the no
   assert.equal(system.length, 1)
 })
 
+test("workspace shell commands translate only the exact managed mount prefix", () => {
+  const state = { host: "alpha", socketPath: "/tmp/one.sock", mode: "workspace" as const, remotePath: "/srv/project", localDirectory: "/local/mount" }
+  const bound = { command: "cat /local/mount/file" }
+  const nonBoundary = { command: "cat /local/mounting/file" }
+  assert.equal(transformShellExecuteBefore({ tool: "shell", sessionID: "one", input: bound }, () => state), true)
+  assert.equal(transformShellExecuteBefore({ tool: "shell", sessionID: "one", input: nonBoundary }, () => state), true)
+  assert.match(bound.command, /cat \/srv\/project\/file/)
+  assert.match(nonBoundary.command, /cat \/local\/mounting\/file/)
+})
+
+test("workspace wrapping quotes a validated remote cwd and strips local cwd", () => {
+  const input = { command: "printf ok", workdir: "/tmp/local" }
+  const state = { host: "alpha", socketPath: "/tmp/one.sock", mode: "workspace" as const, remotePath: "/srv/a path/'q'" }
+  assert.equal(transformShellExecuteBefore({ tool: "shell", sessionID: "one", input }, () => state), true)
+  assert.equal(input.workdir, undefined)
+  assert.match(input.command, /cd --/)
+  assert.match(input.command, /srv\/a path/)
+})
+
+test("workspace connections bind per session and preserve local tools", async () => {
+  const runner = new FakeRunner()
+  const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(new Set()) })
+  const first = await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+  const reused = await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+  const descendant = await connections.connectWorkspace("one", "alpha", "/srv/one/src", "/mnt/one/src")
+  const second = await connections.connectWorkspace("two", "alpha", "/srv/one", "/mnt/one")
+  assert.equal(first.mode, "workspace")
+  assert.equal(first.socketPath, reused.socketPath)
+  assert.equal(first.socketPath, descendant.socketPath)
+  assert.equal(descendant.remotePath, "/srv/one/src")
+  assert.equal(runner.calls.filter((call) => call.args[0] === "-MNf").length, 2)
+  assert.notEqual(first.socketPath, second.socketPath)
+  const input = { command: "pwd", workdir: "/mnt/one" }
+  assert.equal(transformShellExecuteBefore({ tool: "shell", sessionID: "one", input }, (id) => connections.get(id)), true)
+  assert.doesNotThrow(() => transformShellExecuteBefore({ tool: "read", sessionID: "one", input: {} }, (id) => connections.get(id)))
+  await connections.cleanup()
+})
+
+test("workspace shell preparation routes ready descendants and fails closed outside the mount", async () => {
+  const runner = new FakeRunner()
+  const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(new Set()) })
+  const lookup = (directory: string) => directory === "/mnt/project/src" ? { host: "alpha", remotePath: "/srv/project/src" } : undefined
+  await prepareWorkspaceShell("one", "shell", { command: "pwd", workdir: "/mnt/project/src" }, { lookup }, connections)
+  assert.equal(connections.get("one")?.mode, "workspace")
+  assert.equal(connections.get("one")?.remotePath, "/srv/project/src")
+  await assert.rejects(() => prepareWorkspaceShell("one", "shell", { command: "pwd", workdir: "/tmp/local" }, { lookup }, connections), /outside|ready/i)
+  await connections.cleanup()
+})
+
+test("associated workspace shell preparation uses the managed mountpoint without workdir", async () => {
+  const runner = new FakeRunner()
+  const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(new Set()) })
+  const mountpoint = "/home/test/.cache/opencode-ssh/workspaces/ws-1"
+  const associations = {
+    attach: () => true,
+    has: (sessionID: string) => sessionID === "one",
+    lookup: (sessionID: string) => sessionID === "one" ? { host: "alpha", remotePath: "/srv/project", localDirectory: mountpoint } : undefined,
+    remove: () => {},
+  }
+  const input = { command: "pwd" }
+  await prepareWorkspaceShell("one", "shell", input, { lookup: () => undefined }, connections, associations)
+  assert.equal(connections.get("one")?.mode, "workspace")
+  assert.equal(connections.get("one")?.localDirectory, mountpoint)
+  assert.equal(transformShellExecuteBefore({ tool: "shell", sessionID: "one", input }, (id) => connections.get(id)), true)
+  assert.match(input.command, /cd --/)
+  assert.match(input.command, /srv\/project/)
+  await connections.cleanup()
+})
+
+test("associated workspace descendants preserve the managed mount root across sibling workdirs", async () => {
+  const connections = new SshConnections({ home: "/home/test", runner: new FakeRunner(), fs: memoryFs(new Set()) })
+  const mountpoint = "/mount"
+  const calls: Array<{ remotePath: string; localDirectory: string }> = []
+  const original = SshConnections.prototype.connectWorkspace
+  SshConnections.prototype.connectWorkspace = async function (_sessionID, host, remotePath, localDirectory) {
+    calls.push({ remotePath, localDirectory })
+    return { host, remotePath, localDirectory, mode: "workspace", socketPath: "/tmp/workspace.sock" }
+  }
+  const associations = {
+    attach: () => true,
+    has: () => true,
+    lookup: () => ({ host: "alpha", remotePath: "/srv", localDirectory: mountpoint }),
+    remove: () => {},
+  }
+  const lookup = (directory: string) => directory === `${mountpoint}/src`
+    ? { host: "alpha", remotePath: "/srv/src" }
+    : directory === `${mountpoint}/tests` ? { host: "alpha", remotePath: "/srv/tests" } : undefined
+  try {
+    await prepareWorkspaceShell("one", "shell", { command: "pwd", workdir: `${mountpoint}/src` }, { lookup }, connections, associations)
+    await prepareWorkspaceShell("one", "shell", { command: "pwd", workdir: `${mountpoint}/tests` }, { lookup }, connections, associations)
+  } finally {
+    SshConnections.prototype.connectWorkspace = original
+    await connections.cleanup()
+  }
+  assert.deepEqual(calls, [
+    { remotePath: "/srv/src", localDirectory: mountpoint },
+    { remotePath: "/srv/tests", localDirectory: mountpoint },
+  ])
+})
+
+test("associated workspace shell preparation routes a safe descendant to its remote subdirectory", async () => {
+  const runner = new FakeRunner()
+  const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(new Set()) })
+  const mountpoint = "/home/test/.cache/opencode-ssh/workspaces/ws-1"
+  const associations = {
+    attach: () => true,
+    has: (sessionID: string) => sessionID === "one",
+    lookup: (sessionID: string) => sessionID === "one" ? { host: "alpha", remotePath: "/srv/project", localDirectory: mountpoint } : undefined,
+    remove: () => {},
+  }
+  const lookup = (directory: string) => directory === `${mountpoint}/src` ? { host: "alpha", remotePath: "/srv/project/src" } : undefined
+
+  await prepareWorkspaceShell("one", "shell", { command: "pwd", workdir: `${mountpoint}/src` }, { lookup }, connections, associations)
+
+  assert.equal(connections.get("one")?.remotePath, "/srv/project/src")
+  await connections.cleanup()
+})
+
+test("associated workspace rejects a workdir under a different managed mount", async () => {
+  const runner = new FakeRunner()
+  const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(new Set()) })
+  const mountA = "/home/test/.cache/opencode-ssh/workspaces/mount-a"
+  const mountB = "/home/test/.cache/opencode-ssh/workspaces/mount-b"
+  const associations = {
+    attach: () => true,
+    has: (sessionID: string) => sessionID === "session-a",
+    lookup: (sessionID: string) => sessionID === "session-a" ? { host: "alpha", remotePath: "/srv/a", localDirectory: mountA } : undefined,
+    remove: () => {},
+  }
+  const lookup = (directory: string) => directory === `${mountB}/src` ? { host: "beta", remotePath: "/srv/b/src" } : undefined
+
+  await assert.rejects(
+    () => prepareWorkspaceShell("session-a", "shell", { command: "pwd", workdir: `${mountB}/src` }, { lookup }, connections, associations),
+    /outside|associated/i,
+  )
+  assert.equal(connections.get("session-a"), undefined)
+  await connections.cleanup()
+})
+
+test("shell preparation tolerates an association becoming ready asynchronously", async () => {
+  const runner = new FakeRunner()
+  const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(new Set()) })
+  const mountpoint = "/home/test/.cache/opencode-ssh/workspaces/async-ready"
+  let ready = false
+  let resolveReady!: () => void
+  const readiness = new Promise<void>((resolve) => { resolveReady = resolve })
+  const workspace = {
+    ownsWorkspace: () => true,
+    lookupWorkspace: (workspaceID: string) => ready && workspaceID === "async-ready"
+      ? { host: "alpha", remotePath: "/srv/project", localDirectory: mountpoint }
+      : undefined,
+    lookup: () => undefined,
+  }
+  const associations = createSessionWorkspaceAssociations(workspace)
+
+  assert.equal(associations.attach("session-lazy", "async-ready"), false)
+  const preparation = prepareWorkspaceShell("session-lazy", "shell", { command: "pwd" }, workspace, connections, associations)
+  ready = true
+  resolveReady()
+  await readiness
+
+  await assert.doesNotReject(() => preparation)
+  assert.equal(connections.get("session-lazy")?.mode, "workspace")
+  await connections.cleanup()
+})
+
+test("non-shell workspace preparation is a no-op and performs no SSH calls", async () => {
+  const runner = new FakeRunner()
+  const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(new Set()) })
+  await prepareWorkspaceShell("one", "read", { workdir: "/mnt/project" }, { lookup: () => ({ host: "alpha", remotePath: "/srv/project" }) }, connections)
+  assert.equal(runner.calls.length, 0)
+})
+test("workspace system messaging preserves local file tools and remote shell semantics", () => {
+  assert.match(workspaceSystemMessage("alpha", "/srv/project"), /local SSHFS mount/)
+  assert.match(workspaceSystemMessage("alpha", "/srv/project"), /execute remotely/)
+})
+
 class FakeRunner implements ProcessRunner {
   calls: Array<{ file: string; args: string[] }> = []
   failures = new Set<string>()
@@ -932,6 +1111,123 @@ test("plugin exposes dual v2 and legacy entrypoints", () => {
   assert.equal(plugin.id, "opencode-ssh")
   assert.equal(typeof plugin.server, "function")
   assert.equal(typeof setupV2, "function")
+})
+
+test("legacy shell hydration retains a managed workspace until its mount is ready", async () => {
+  const originalConnectWorkspace = SshConnections.prototype.connectWorkspace
+  const originalGet = SshConnections.prototype.get
+  const originalGetForShell = SshConnections.prototype.getForShell
+  let ready = false
+  let state: any
+  let releaseSession: ((value: unknown) => void) | undefined
+  SshConnections.prototype.connectWorkspace = async function (_sessionID, host, remotePath, localDirectory) {
+    state = { host, remotePath, localDirectory, mode: "workspace", socketPath: "/tmp/pending-managed.sock" }
+    return state
+  }
+  SshConnections.prototype.get = function () { return state }
+  SshConnections.prototype.getForShell = function () { return state }
+  try {
+    const hooks = await plugin.server({
+      client: { session: { get: async () => await new Promise((resolve) => { releaseSession = resolve }) } },
+      experimental_workspace: { register(_type: string, adapter: any) {
+        adapter.lookupWorkspace = (id: string) => ready && id === "pending-managed"
+          ? { host: "alpha", remotePath: "/srv/project", localDirectory: "/tmp/pending-managed-mount" }
+          : undefined
+        adapter.ownsWorkspace = (id: string) => id === "pending-managed"
+      } },
+    } as never)
+    const first = hooks["tool.execute.before"]?.({ sessionID: "session-pending", tool: "shell" }, { args: { command: "pwd" } })
+    releaseSession?.({ data: { location: { workspaceID: "pending-managed" } } })
+    await delay(0)
+    ready = true
+    await first
+    assert.equal(state.localDirectory, "/tmp/pending-managed-mount")
+    await hooks.dispose?.()
+  } finally {
+    SshConnections.prototype.connectWorkspace = originalConnectWorkspace
+    SshConnections.prototype.get = originalGet
+    SshConnections.prototype.getForShell = originalGetForShell
+  }
+})
+
+test("unknown workspace events remain local and do not poison session associations", async () => {
+  const hooks = await plugin.server({
+    client: { session: { get: async () => ({ data: { location: { workspaceID: "worktree-1" } } }) } },
+    experimental_workspace: { register() {} },
+  } as never)
+  await hooks.event?.({ event: { type: "session.created", properties: { info: { id: "session-worktree", workspaceID: "worktree-1" } } } })
+  await assert.doesNotReject(() => hooks["tool.execute.before"]?.({ sessionID: "session-worktree", tool: "shell" }, { args: { command: "pwd" } }))
+  await hooks.dispose?.()
+})
+
+test("clearing a session workspaceID detaches the prior workspace association", async () => {
+  const originalConnectWorkspace = SshConnections.prototype.connectWorkspace
+  let connects = 0
+  SshConnections.prototype.connectWorkspace = async function () {
+    connects++
+    return { host: "alpha", remotePath: "/srv", localDirectory: "/tmp/mount", mode: "workspace", socketPath: "/tmp/socket" }
+  }
+  try {
+    let hydration = 0
+    const hooks = await plugin.server({
+      client: { session: { get: async () => hydration++ === 0 ? ({ data: { location: { workspaceID: "managed-id" } } }) : ({ data: {} }) } },
+      experimental_workspace: { register(_type: string, adapter: any) {
+        adapter.ownsWorkspace = (id: string) => id === "managed-id"
+        adapter.lookupWorkspace = (id: string) => id === "managed-id" ? { host: "alpha", remotePath: "/srv", localDirectory: "/tmp/mount" } : undefined
+      } },
+    } as never)
+    await hooks["tool.execute.before"]?.({ sessionID: "session-clear", tool: "shell" }, { args: { command: "pwd" } })
+    assert.equal(connects, 1)
+    await hooks.event?.({ event: { type: "session.updated", properties: { info: { id: "session-clear" } } } })
+    await hooks["tool.execute.before"]?.({ sessionID: "session-clear", tool: "shell" }, { args: { command: "pwd" } })
+    assert.equal(connects, 1)
+    await hooks.dispose?.()
+  } finally {
+    SshConnections.prototype.connectWorkspace = originalConnectWorkspace
+  }
+})
+
+test("legacy shell hydration reads the SDK location and leaves unknown workspaces local", async () => {
+  const requests: unknown[] = []
+  const hooks = await plugin.server({
+    client: { session: { get: async (options: unknown) => { requests.push(options); return { data: { location: { workspaceID: "worktree-1" } } } } } },
+    experimental_workspace: { register() {} },
+  } as never)
+  await hooks["tool.execute.before"]?.({ sessionID: "session-1", tool: "shell" }, { args: { command: "pwd" } })
+  await hooks["tool.execute.before"]?.({ sessionID: "session-1", tool: "read" }, { args: { path: "README.md" } })
+  assert.deepEqual(requests, [{ path: { id: "session-1" } }])
+  await hooks.dispose?.()
+})
+
+test("legacy shell hydration attaches a managed SDK workspace before remote transformation", async () => {
+  const requests: unknown[] = []
+  const mount = "/tmp/managed-mount"
+  const originalConnectWorkspace = SshConnections.prototype.connectWorkspace
+  const originalGet = SshConnections.prototype.get
+  const originalGetForShell = SshConnections.prototype.getForShell
+  let state: any
+  SshConnections.prototype.connectWorkspace = async function (_sessionID, host, remotePath, localDirectory) {
+    state = { host, remotePath, localDirectory, mode: "workspace", socketPath: "/tmp/managed.sock" }
+    return state
+  }
+  SshConnections.prototype.get = function () { return state }
+  SshConnections.prototype.getForShell = function () { return state }
+  try {
+    const hooks = await plugin.server({
+      client: { session: { get: async (options: unknown) => { requests.push(options); return { data: { location: { workspaceID: "managed-id" } } } } } },
+      experimental_workspace: { register(_type: string, adapter: any) { adapter.lookupWorkspace = (id: string) => id === "managed-id" ? { host: "alpha", remotePath: "/srv/project", localDirectory: mount } : undefined; adapter.ownsWorkspace = (id: string) => id === "managed-id" } },
+    } as never)
+    const args = { command: "pwd" }
+    await hooks["tool.execute.before"]?.({ sessionID: "session-managed", tool: "shell" }, { args })
+    assert.deepEqual(requests, [{ path: { id: "session-managed" } }])
+    assert.equal(state.localDirectory, mount)
+    assert.match(args.command, /cd -- .*\/srv\/project/)
+    await hooks.dispose?.()
+  } finally {
+    SshConnections.prototype.connectWorkspace = originalConnectWorkspace
+    SshConnections.prototype.get = originalGet
+    SshConnections.prototype.getForShell = originalGetForShell
+  }
 })
 
 test("legacy server exposes populated argument schemas and v2 keeps direct options", async () => {

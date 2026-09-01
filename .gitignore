@@ -10,4 +10,6 @@ dist/src/*
 !dist/src/channel.d.ts
 !dist/src/pty-helper.js
 !dist/src/pty-helper.d.ts
+!dist/src/workspace.js
+!dist/src/workspace.d.ts
 .DS_Store

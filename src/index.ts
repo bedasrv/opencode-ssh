@@ -1,28 +1,39 @@
-import { execFile } from "node:child_process"
 import { promises as fs } from "node:fs"
 import { z } from "zod"
+import type { PluginInput } from "@opencode-ai/plugin"
+import { createCommandRunner, createSessionWorkspaceAssociations, createWorkspaceAdapter, type WorkspaceBinding } from "./workspace.js"
 import {
   SshConnections,
   applyRemoteContext,
   consumeSessionDeletions,
   remoteSystemMessage,
+  workspaceSystemMessage,
   transformShellExecuteBefore,
-  type ProcessRunner,
 } from "./ssh.js"
 import { SshChannelManager, createLocalPtyTransport, type ChannelRecord } from "./channel.js"
 
-const runner: ProcessRunner = {
-  run(file, args, options) {
-    return new Promise((resolve, reject) => {
-      execFile(file, args, { ...options, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
-        if (error) {
-          Object.assign(error, { stderr })
-          reject(error)
-        }
-        else resolve({ stdout, stderr, code: 0 })
-      })
-    })
-  },
+const runner = createCommandRunner()
+
+let legacyConnections: SshConnections | undefined
+let legacyConnectionUsers = 0
+
+function acquireLegacyConnections(): SshConnections {
+  if (!legacyConnections) legacyConnections = new SshConnections({ runner, fs: {
+    mkdir: async (path, options) => { await fs.mkdir(path, options) },
+    rm: async (path, options) => { await fs.rm(path, options) },
+    exists: async (path) => { try { await fs.stat(path); return true } catch { return false } },
+    chmod: async (path, mode) => { await fs.chmod(path, mode) },
+    lstat: async (path) => await fs.lstat(path),
+  } })
+  legacyConnectionUsers++
+  return legacyConnections
+}
+
+async function releaseLegacyConnections(connections: SshConnections): Promise<void> {
+  legacyConnectionUsers--
+  if (legacyConnectionUsers > 0 || legacyConnections !== connections) return
+  legacyConnections = undefined
+  await connections.cleanup()
 }
 
 type JsonTool = {
@@ -96,18 +107,75 @@ const legacyArgs = {
 
 const isInputObject = (value: unknown): value is object => typeof value === "object" && value !== null
 
-const server = async () => {
-    const connections = new SshConnections({ runner, fs: {
+function sessionEventID(event: any): string | undefined {
+  const info = event?.properties?.info ?? event?.data?.info ?? event?.data
+  return typeof info?.id === "string" ? info.id : typeof info?.sessionID === "string" ? info.sessionID : undefined
+}
+
+function sessionWorkspaceID(event: any): string | undefined {
+  const info = event?.properties?.info ?? event?.data?.info ?? event?.data
+  return typeof info?.workspaceID === "string" ? info.workspaceID : undefined
+}
+
+async function hydrateWorkspaceSession(input: PluginInput | undefined, sessionID: string, workspace: { lookupWorkspace(id: string): unknown }, associations: ReturnType<typeof createSessionWorkspaceAssociations>): Promise<void> {
+  if (!input || associations.lookup(sessionID)) return
+  const response = await input.client.session.get({ path: { id: sessionID } })
+  const workspaceID = (response as any)?.data?.location?.workspaceID ?? (response as any)?.data?.workspaceID
+  if (typeof workspaceID === "string") associations.attach(sessionID, workspaceID)
+}
+
+async function waitForWorkspaceBinding(associations: ReturnType<typeof createSessionWorkspaceAssociations>, sessionID: string): Promise<WorkspaceBinding | undefined> {
+  const deadline = Date.now() + 5000
+  while (Date.now() < deadline) {
+    const binding = associations.lookup(sessionID)
+    if (binding) return binding
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  return associations.lookup(sessionID)
+}
+
+function isWorkspaceRootOrDescendant(root: string, directory: string): boolean {
+  return directory === root || directory.startsWith(`${root}/`)
+}
+
+export async function prepareWorkspaceShell(sessionID: string, tool: string, input: any, workspace: { lookup(directory: string): { host: string; remotePath: string } | undefined }, connections: SshConnections, associations?: ReturnType<typeof createSessionWorkspaceAssociations>): Promise<void> {
+  if (tool !== "shell" && tool !== "bash") return
+  if (!isInputObject(input)) return
+  const current = connections.get(sessionID)
+  if (current?.mode === "shell") return
+  const payload = input as Record<string, unknown>
+  const workdir = typeof payload.workdir === "string" ? payload.workdir : typeof payload.cwd === "string" ? payload.cwd : undefined
+  let associated: (WorkspaceBinding & { localDirectory?: string }) | undefined = associations?.lookup(sessionID)
+  if (associations?.has(sessionID) && !associated) associated = await waitForWorkspaceBinding(associations, sessionID)
+  if (associations?.has(sessionID) && !associated) throw new Error("SSHFS workspace session is not attached to a ready workspace")
+  if (!associated && !current && (associations || !workdir)) return
+  const workdirBinding = workdir ? workspace.lookup(workdir) : undefined
+  const associatedRoot = associated?.localDirectory ?? current?.localDirectory
+  if ((current?.mode === "workspace" || associated) && workdir && (!workdirBinding || !associatedRoot || !isWorkspaceRootOrDescendant(associatedRoot, workdir))) throw new Error("SSHFS workspace workdir is outside the associated managed mount")
+  const binding = workdirBinding ?? associated ?? (associations
+    ? (current?.mode === "workspace" ? { host: current.host, remotePath: current.remotePath! } : undefined)
+    : (current?.mode === "workspace" ? { host: current.host, remotePath: current.remotePath! } : undefined))
+  if (!binding) return
+  const state = await connections.connectWorkspace(sessionID, binding.host, binding.remotePath, (associated as { localDirectory?: string } | undefined)?.localDirectory ?? current?.localDirectory ?? workdir ?? "")
+  if (!state.localDirectory) throw new Error("SSHFS workspace binding has no local directory")
+}
+
+const server = async (input?: PluginInput) => {
+    const workspace = createWorkspaceAdapter({ home: undefined, runner, fs: {
       mkdir: async (path, options) => { await fs.mkdir(path, options) },
       rm: async (path, options) => { await fs.rm(path, options) },
       exists: async (path) => { try { await fs.stat(path); return true } catch { return false } },
       chmod: async (path, mode) => { await fs.chmod(path, mode) },
-      lstat: async (path) => { return await fs.lstat(path) },
+      lstat: async (path) => await fs.lstat(path),
     } })
+    if (input) input.experimental_workspace.register("sshfs", workspace)
+    const associations = createSessionWorkspaceAssociations(workspace)
+    const connections = acquireLegacyConnections()
     const channels = new SshChannelManager({ transport: createLocalPtyTransport() })
 
     // Call IDs remain stable across before/after hook payloads.
     const countedShells = new Set<string>()
+    let disposed = false
 
     const definitions = [...sshToolRegistrations(connections), ...sshChannelToolRegistrations(channels)]
     const tools = Object.fromEntries(definitions.map((definition) => [definition.name, {
@@ -120,6 +188,10 @@ const server = async () => {
       "tool.execute.before": async (event: any, output: any) => {
       // getForShell rejects shell attempts racing an in-progress disconnect so
       // they cannot fall through to local execution; context keeps using get().
+        if ((event.tool === "shell" || event.tool === "bash") && connections.get(event.sessionID)?.mode !== "shell") {
+          await hydrateWorkspaceSession(input, event.sessionID, workspace, associations)
+        }
+        await prepareWorkspaceShell(event.sessionID, event.tool, output.args, workspace, connections, associations)
         const shellEvent = { tool: event.tool, sessionID: event.sessionID, input: output.args }
         if (!transformShellExecuteBefore(shellEvent, (sessionID) => connections.getForShell(sessionID))) return
         if (!countedShells.has(event.callID)) {
@@ -133,20 +205,33 @@ const server = async () => {
         connections.noteShellEnd(event.sessionID)
       },
       event: async ({ event }: any) => {
-        if (event.type !== "session.deleted") return
-        await Promise.all([connections.disconnect(event.properties.info.id), channels.closeSession(event.properties.info.id)])
+        const sessionID = sessionEventID(event)
+        if (event.type === "session.created" || event.type === "session.updated") {
+          if (sessionID) {
+            const workspaceID = sessionWorkspaceID(event)
+            if (workspaceID) associations.attach(sessionID, workspaceID)
+            else associations.remove(sessionID)
+          }
+          return
+        }
+        if (event.type !== "session.deleted" || !sessionID) return
+        associations.remove(sessionID)
+        await Promise.all([connections.disconnect(sessionID), channels.closeSession(sessionID)])
       },
       "experimental.chat.system.transform": async ({ sessionID }: any, output: any) => {
         if (!sessionID) return
         const state = connections.get(sessionID)
         if (state) {
-          const text = remoteSystemMessage(state.host)
+          const text = state.mode === "workspace" ? workspaceSystemMessage(state.host, state.remotePath ?? "") : remoteSystemMessage(state.host)
           if (!output.system.includes(text)) output.system.push(text)
         }
       },
       dispose: async () => {
-      await channels.cleanup()
-      await connections.cleanup()
+        if (disposed) return
+        disposed = true
+        const results = await Promise.allSettled([workspace.cleanup(), channels.cleanup(), releaseLegacyConnections(connections)])
+        const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : [])
+        if (errors.length) throw new AggregateError(errors, errors.map((error) => error instanceof Error ? error.message : String(error)).join("; "))
       },
     }
 }
@@ -205,3 +290,5 @@ export {
   validateHost,
   wrapRemoteCommand,
 } from "./ssh.js"
+
+export { createWorkspaceAdapter } from "./workspace.js"
