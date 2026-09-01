@@ -119,12 +119,30 @@ export type WorkspaceAdapterInstance = Omit<WorkspaceAdapter, "configure"> & {
   configure(config: WorkspaceInfo): Promise<WorkspaceInfo>
   cleanup(): Promise<void>
   lookup(directory: string): WorkspaceBinding | undefined
+  lookupWorkspaceDirectory(directory: string): WorkspaceSessionBinding | undefined
   ownsWorkspace(id: string): boolean
   lookupWorkspace(id: string): WorkspaceBinding | undefined
 }
 
 export type WorkspaceBinding = { host: string; remotePath: string }
 export type WorkspaceSessionBinding = WorkspaceBinding & { localDirectory: string }
+
+function lookupManagedDirectory(signatures: Map<string, string>, ready: Set<string>, directory: string): WorkspaceSessionBinding | undefined {
+  if (typeof directory !== "string" || !directory.startsWith("/") || /[\x00-\x1f\x7f]/.test(directory)) return undefined
+  for (const [root, signature] of signatures) {
+    if (!ready.has(root) || (directory !== root && !directory.startsWith(`${root}/`))) continue
+    const suffix = directory.slice(root.length)
+    if (suffix.split("/").some((part) => part === "." || part === "..")) return undefined
+    const separator = signature.indexOf("\0")
+    if (separator < 0) return undefined
+    return {
+      host: signature.slice(0, separator),
+      remotePath: posix.join(signature.slice(separator + 1), suffix),
+      localDirectory: root,
+    }
+  }
+  return undefined
+}
 
 export function createWorkspaceAdapter(dependencies: Dependencies): WorkspaceAdapterInstance {
   const home = dependencies.home ?? homedir()
@@ -251,15 +269,11 @@ export function createWorkspaceAdapter(dependencies: Dependencies): WorkspaceAda
       return { type: "local", directory: config.directory }
     },
     lookup(directory: string): WorkspaceBinding | undefined {
-      if (typeof directory !== "string" || !directory.startsWith("/") || /[\x00-\x1f\x7f]/.test(directory)) return undefined
-      for (const [root, signature] of signatures) {
-        if (!ready.has(root) || (directory !== root && !directory.startsWith(`${root}/`))) continue
-        const suffix = directory.slice(root.length)
-        if (suffix.split("/").some((part) => part === "." || part === "..")) return undefined
-        const [host, remotePath] = signature.split("\0")
-        return { host, remotePath: posix.join(remotePath, suffix) }
-      }
-      return undefined
+      const binding = lookupManagedDirectory(signatures, ready, directory)
+      return binding ? { host: binding.host, remotePath: binding.remotePath } : undefined
+    },
+    lookupWorkspaceDirectory(directory: string): WorkspaceSessionBinding | undefined {
+      return lookupManagedDirectory(signatures, ready, directory)
     },
     ownsWorkspace(id: string): boolean {
       if (typeof id !== "string" || !id || id.includes("/") || id === "." || id === "..") return false

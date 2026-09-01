@@ -23,7 +23,7 @@ Add it to `~/.config/opencode/opencode.json`:
 
 For a local source checkout, install the package into `~/.config/opencode` as above, then reference the installed package by its explicit local path, `./node_modules/opencode-ssh`. The singular `plugin` key is the OpenCode v2 configuration key. Local paths start with `./` and are resolved relative to `~/.config/opencode/opencode.json`.
 
-The package exports both server() and setupV2() surfaces. On the verified OpenCode runtime 0.0.0-dev-202608311804, the certified model-facing route is the legacy server() surface through /session and /experimental/tool. A live /api/session probe on this runtime did not expose the custom SSH tools, so the native /api/session setupV2() path is not production-supported here. The setupV2() export is retained for compatible runtimes that provide the required custom-tool registration API; do not treat this package as blanket v2 support.
+The package exports a dual default entrypoint, `server()` and `setup()`, plus a named `setupV2()` alias. On the verified OpenCode runtime 0.0.0-dev-202608311804 the native `/api/session` surface loads the dual default entrypoint (no `SchemaError`), but its live promise context did not expose a custom-tool registration hook, so the native runtime no-ops setup safely and the certified model-facing route is the legacy `server()` surface through `/session` and `/experimental/tool`. On runtimes that do expose a `tool.hook("execute.before")` context, `setup()` registers the SSH tools and routes native `shell`/`bash` calls through SSHFS workspaces. Contexts without that hook no-op and return a no-op cleanup, and cleanup aggregates errors from the workspace adapter, channels, and connections.
 
 ## Usage
 

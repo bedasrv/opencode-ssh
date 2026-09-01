@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs"
 import { z } from "zod"
 import type { PluginInput } from "@opencode-ai/plugin"
-import { createCommandRunner, createSessionWorkspaceAssociations, createWorkspaceAdapter, type WorkspaceBinding } from "./workspace.js"
+import { createCommandRunner, createSessionWorkspaceAssociations, createWorkspaceAdapter, type WorkspaceBinding, type WorkspaceSessionBinding } from "./workspace.js"
 import {
   SshConnections,
   applyRemoteContext,
@@ -138,7 +138,7 @@ function isWorkspaceRootOrDescendant(root: string, directory: string): boolean {
   return directory === root || directory.startsWith(`${root}/`)
 }
 
-export async function prepareWorkspaceShell(sessionID: string, tool: string, input: any, workspace: { lookup(directory: string): { host: string; remotePath: string } | undefined }, connections: SshConnections, associations?: ReturnType<typeof createSessionWorkspaceAssociations>): Promise<void> {
+export async function prepareWorkspaceShell(sessionID: string, tool: string, input: any, workspace: { lookup(directory: string): WorkspaceBinding | undefined; lookupWorkspaceDirectory?: (directory: string) => WorkspaceSessionBinding | undefined }, connections: SshConnections, associations?: ReturnType<typeof createSessionWorkspaceAssociations>): Promise<void> {
   if (tool !== "shell" && tool !== "bash") return
   if (!isInputObject(input)) return
   const current = connections.get(sessionID)
@@ -148,15 +148,16 @@ export async function prepareWorkspaceShell(sessionID: string, tool: string, inp
   let associated: (WorkspaceBinding & { localDirectory?: string }) | undefined = associations?.lookup(sessionID)
   if (associations?.has(sessionID) && !associated) associated = await waitForWorkspaceBinding(associations, sessionID)
   if (associations?.has(sessionID) && !associated) throw new Error("SSHFS workspace session is not attached to a ready workspace")
-  if (!associated && !current && (associations || !workdir)) return
-  const workdirBinding = workdir ? workspace.lookup(workdir) : undefined
+  if (!associated && !current && !workdir) return
+  const managedWorkdir = workdir ? workspace.lookupWorkspaceDirectory?.(workdir) : undefined
+  const workdirBinding = managedWorkdir ?? (workdir ? workspace.lookup(workdir) : undefined)
   const associatedRoot = associated?.localDirectory ?? current?.localDirectory
   if ((current?.mode === "workspace" || associated) && workdir && (!workdirBinding || !associatedRoot || !isWorkspaceRootOrDescendant(associatedRoot, workdir))) throw new Error("SSHFS workspace workdir is outside the associated managed mount")
   const binding = workdirBinding ?? associated ?? (associations
     ? (current?.mode === "workspace" ? { host: current.host, remotePath: current.remotePath! } : undefined)
     : (current?.mode === "workspace" ? { host: current.host, remotePath: current.remotePath! } : undefined))
   if (!binding) return
-  const state = await connections.connectWorkspace(sessionID, binding.host, binding.remotePath, (associated as { localDirectory?: string } | undefined)?.localDirectory ?? current?.localDirectory ?? workdir ?? "")
+  const state = await connections.connectWorkspace(sessionID, binding.host, binding.remotePath, managedWorkdir?.localDirectory ?? (associated as { localDirectory?: string } | undefined)?.localDirectory ?? current?.localDirectory ?? workdir ?? "")
   if (!state.localDirectory) throw new Error("SSHFS workspace binding has no local directory")
 }
 
@@ -237,6 +238,7 @@ const server = async (input?: PluginInput) => {
 }
 
 export async function setupV2(ctx: V2Context) {
+  if (!ctx?.tool || typeof ctx.tool.transform !== "function" || typeof ctx.tool.hook !== "function" || !ctx.session || typeof ctx.session.hook !== "function" || !ctx.event || typeof ctx.event.subscribe !== "function") return async () => {}
   const connections = new SshConnections({ runner, fs: {
     mkdir: async (path, options) => { await fs.mkdir(path, options) },
     rm: async (path, options) => { await fs.rm(path, options) },
@@ -244,6 +246,14 @@ export async function setupV2(ctx: V2Context) {
     chmod: async (path, mode) => { await fs.chmod(path, mode) },
     lstat: async (path) => await fs.lstat(path),
   } })
+  const workspace = createWorkspaceAdapter({ home: undefined, runner, fs: {
+    mkdir: async (path, options) => { await fs.mkdir(path, options) },
+    rm: async (path, options) => { await fs.rm(path, options) },
+    exists: async (path) => { try { await fs.stat(path); return true } catch { return false } },
+    chmod: async (path, mode) => { await fs.chmod(path, mode) },
+    lstat: async (path) => await fs.lstat(path),
+  } })
+  const associations = createSessionWorkspaceAssociations(workspace)
   const channels = new SshChannelManager({ transport: createLocalPtyTransport() })
   const countedShells = new Set<string>()
 
@@ -251,6 +261,9 @@ export async function setupV2(ctx: V2Context) {
     for (const definition of [...sshToolRegistrations(connections), ...sshChannelToolRegistrations(channels)]) draft.add(definition)
   })
   await ctx.tool.hook("execute.before", async (event) => {
+    if ((event.tool === "shell" || event.tool === "bash") && connections.get(event.sessionID)?.mode !== "shell") {
+      await prepareWorkspaceShell(event.sessionID, event.tool, event.input, workspace, connections, associations)
+    }
     const shellEvent = { tool: event.tool, sessionID: event.sessionID, input: event.input }
     if (!transformShellExecuteBefore(shellEvent, (sessionID) => connections.getForShell(sessionID))) return
     if (!countedShells.has(event.id)) {
@@ -272,12 +285,13 @@ export async function setupV2(ctx: V2Context) {
   })
   return async () => {
     await deletions.stop()
-    await channels.cleanup()
-    await connections.cleanup()
+    const results = await Promise.allSettled([workspace.cleanup(), channels.cleanup(), connections.cleanup()])
+    const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : [])
+    if (errors.length) throw new AggregateError(errors, errors.map((error) => error instanceof Error ? error.message : String(error)).join("; "))
   }
 }
 
-export default { id: "opencode-ssh", server }
+export default { id: "opencode-ssh", server, setup: setupV2 }
 
 export {
   SshConnections,

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { PluginInput } from "@opencode-ai/plugin";
-import { createSessionWorkspaceAssociations } from "./workspace.js";
+import { createSessionWorkspaceAssociations, type WorkspaceBinding, type WorkspaceSessionBinding } from "./workspace.js";
 import { SshConnections } from "./ssh.js";
 import { SshChannelManager } from "./channel.js";
 type JsonTool = {
@@ -47,10 +47,8 @@ export declare function applyV2SessionContext(context: V2SessionContext, host: s
 export declare function sshChannelToolRegistrations(manager: SshChannelManager): JsonTool[];
 export declare function sshToolRegistrations(connections: SshConnections): JsonTool[];
 export declare function prepareWorkspaceShell(sessionID: string, tool: string, input: any, workspace: {
-    lookup(directory: string): {
-        host: string;
-        remotePath: string;
-    } | undefined;
+    lookup(directory: string): WorkspaceBinding | undefined;
+    lookupWorkspaceDirectory?: (directory: string) => WorkspaceSessionBinding | undefined;
 }, connections: SshConnections, associations?: ReturnType<typeof createSessionWorkspaceAssociations>): Promise<void>;
 export declare function setupV2(ctx: V2Context): Promise<() => Promise<void>>;
 declare const _default: {
@@ -93,6 +91,7 @@ declare const _default: {
         "experimental.chat.system.transform": ({ sessionID }: any, output: any) => Promise<void>;
         dispose: () => Promise<void>;
     }>;
+    setup: typeof setupV2;
 };
 export default _default;
 export { SshConnections, LOCAL_WORKSPACE_TOOLS, applyRemoteContext, consumeSessionDeletions, quotePosix, socketPath, transformShellExecuteBefore, validateHost, wrapRemoteCommand, } from "./ssh.js";

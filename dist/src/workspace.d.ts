@@ -63,6 +63,7 @@ export type WorkspaceAdapterInstance = Omit<WorkspaceAdapter, "configure"> & {
     configure(config: WorkspaceInfo): Promise<WorkspaceInfo>;
     cleanup(): Promise<void>;
     lookup(directory: string): WorkspaceBinding | undefined;
+    lookupWorkspaceDirectory(directory: string): WorkspaceSessionBinding | undefined;
     ownsWorkspace(id: string): boolean;
     lookupWorkspace(id: string): WorkspaceBinding | undefined;
 };

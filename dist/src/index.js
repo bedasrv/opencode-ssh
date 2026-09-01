@@ -117,9 +117,10 @@ export async function prepareWorkspaceShell(sessionID, tool, input, workspace, c
         associated = await waitForWorkspaceBinding(associations, sessionID);
     if (associations?.has(sessionID) && !associated)
         throw new Error("SSHFS workspace session is not attached to a ready workspace");
-    if (!associated && !current && (associations || !workdir))
+    if (!associated && !current && !workdir)
         return;
-    const workdirBinding = workdir ? workspace.lookup(workdir) : undefined;
+    const managedWorkdir = workdir ? workspace.lookupWorkspaceDirectory?.(workdir) : undefined;
+    const workdirBinding = managedWorkdir ?? (workdir ? workspace.lookup(workdir) : undefined);
     const associatedRoot = associated?.localDirectory ?? current?.localDirectory;
     if ((current?.mode === "workspace" || associated) && workdir && (!workdirBinding || !associatedRoot || !isWorkspaceRootOrDescendant(associatedRoot, workdir)))
         throw new Error("SSHFS workspace workdir is outside the associated managed mount");
@@ -128,7 +129,7 @@ export async function prepareWorkspaceShell(sessionID, tool, input, workspace, c
         : (current?.mode === "workspace" ? { host: current.host, remotePath: current.remotePath } : undefined));
     if (!binding)
         return;
-    const state = await connections.connectWorkspace(sessionID, binding.host, binding.remotePath, associated?.localDirectory ?? current?.localDirectory ?? workdir ?? "");
+    const state = await connections.connectWorkspace(sessionID, binding.host, binding.remotePath, managedWorkdir?.localDirectory ?? associated?.localDirectory ?? current?.localDirectory ?? workdir ?? "");
     if (!state.localDirectory)
         throw new Error("SSHFS workspace binding has no local directory");
 }
@@ -221,6 +222,8 @@ const server = async (input) => {
     };
 };
 export async function setupV2(ctx) {
+    if (!ctx?.tool || typeof ctx.tool.transform !== "function" || typeof ctx.tool.hook !== "function" || !ctx.session || typeof ctx.session.hook !== "function" || !ctx.event || typeof ctx.event.subscribe !== "function")
+        return async () => { };
     const connections = new SshConnections({ runner, fs: {
             mkdir: async (path, options) => { await fs.mkdir(path, options); },
             rm: async (path, options) => { await fs.rm(path, options); },
@@ -234,6 +237,20 @@ export async function setupV2(ctx) {
             chmod: async (path, mode) => { await fs.chmod(path, mode); },
             lstat: async (path) => await fs.lstat(path),
         } });
+    const workspace = createWorkspaceAdapter({ home: undefined, runner, fs: {
+            mkdir: async (path, options) => { await fs.mkdir(path, options); },
+            rm: async (path, options) => { await fs.rm(path, options); },
+            exists: async (path) => { try {
+                await fs.stat(path);
+                return true;
+            }
+            catch {
+                return false;
+            } },
+            chmod: async (path, mode) => { await fs.chmod(path, mode); },
+            lstat: async (path) => await fs.lstat(path),
+        } });
+    const associations = createSessionWorkspaceAssociations(workspace);
     const channels = new SshChannelManager({ transport: createLocalPtyTransport() });
     const countedShells = new Set();
     await ctx.tool.transform((draft) => {
@@ -241,6 +258,9 @@ export async function setupV2(ctx) {
             draft.add(definition);
     });
     await ctx.tool.hook("execute.before", async (event) => {
+        if ((event.tool === "shell" || event.tool === "bash") && connections.get(event.sessionID)?.mode !== "shell") {
+            await prepareWorkspaceShell(event.sessionID, event.tool, event.input, workspace, connections, associations);
+        }
         const shellEvent = { tool: event.tool, sessionID: event.sessionID, input: event.input };
         if (!transformShellExecuteBefore(shellEvent, (sessionID) => connections.getForShell(sessionID)))
             return;
@@ -265,10 +285,12 @@ export async function setupV2(ctx) {
     });
     return async () => {
         await deletions.stop();
-        await channels.cleanup();
-        await connections.cleanup();
+        const results = await Promise.allSettled([workspace.cleanup(), channels.cleanup(), connections.cleanup()]);
+        const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+        if (errors.length)
+            throw new AggregateError(errors, errors.map((error) => error instanceof Error ? error.message : String(error)).join("; "));
     };
 }
-export default { id: "opencode-ssh", server };
+export default { id: "opencode-ssh", server, setup: setupV2 };
 export { SshConnections, LOCAL_WORKSPACE_TOOLS, applyRemoteContext, consumeSessionDeletions, quotePosix, socketPath, transformShellExecuteBefore, validateHost, wrapRemoteCommand, } from "./ssh.js";
 export { createWorkspaceAdapter } from "./workspace.js";

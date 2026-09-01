@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
+import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
 import plugin, { setupV2, applyV2SessionContext, prepareWorkspaceShell, sshToolRegistrations, sshChannelToolRegistrations } from "../src/index.js"
 import * as pluginNamespace from "../src/index.js"
@@ -17,7 +18,7 @@ import {
   type ProcessRunner,
 } from "../src/ssh.js"
 import { SshChannelManager, createLocalPtyTransport, interactiveSshArgs, MAX_INPUT } from "../src/channel.js"
-import { createSessionWorkspaceAssociations } from "../src/workspace.js"
+import { createSessionWorkspaceAssociations, createWorkspaceAdapter, type WorkspaceChild, type WorkspaceRunner } from "../src/workspace.js"
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
@@ -1290,11 +1291,113 @@ test("v2 compatibility export registers every SSH tool as a direct tool", async 
   for (const tool of added) assert.deepEqual(tool.options, { codemode: false })
 })
 
-test("default export has one legacy registration surface", () => {
+test("default export exposes both native and legacy registration surfaces", () => {
   assert.equal(plugin.id, "opencode-ssh")
   assert.equal(typeof plugin.server, "function")
-  assert.equal((plugin as any).setup, undefined)
+  assert.equal(typeof (plugin as any).setup, "function")
   assert.equal(typeof setupV2, "function")
+})
+
+test("native workspace shell derives remote CWD from a managed local workdir", async () => {
+  const originalConnectWorkspace = SshConnections.prototype.connectWorkspace
+  let state: any
+  SshConnections.prototype.connectWorkspace = async function (_sessionID, host, remotePath, localDirectory) {
+    state = { host, remotePath, localDirectory, mode: "workspace", socketPath: "/tmp/native-workspace.sock" }
+    return state
+  }
+  try {
+    const mount = "/tmp/native-workspace-mount"
+    const connections = new SshConnections({ home: "/home/test", runner: new FakeRunner(), fs: memoryFs(new Set()) })
+    const workspace = {
+      lookup: () => undefined,
+      lookupWorkspaceDirectory: (directory: string) => directory === `${mount}/src/file`
+        ? { host: "alpha", remotePath: "/srv/project/src/file", localDirectory: mount }
+        : undefined,
+    }
+    await prepareWorkspaceShell("native-session", "shell", { command: "pwd", workdir: `${mount}/src/file` }, workspace as never, connections)
+    assert.deepEqual(state, { host: "alpha", remotePath: "/srv/project/src/file", localDirectory: mount, mode: "workspace", socketPath: "/tmp/native-workspace.sock" })
+  } finally {
+    SshConnections.prototype.connectWorkspace = originalConnectWorkspace
+  }
+})
+
+test("setupV2 execute.before routes managed workspace descendants and rejects cross-root workdirs", async () => {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const home = homedir()
+  const files = new Set<string>()
+  const runner: WorkspaceRunner = {
+    async run(file, args) {
+      if (file === "sftp") return { stdout: "Remote working directory: /srv/project\\n", stderr: "", code: 0 }
+      if (file === "findmnt") return { stdout: `${args[1]} fuse.sshfs\\n`, stderr: "", code: 0 }
+      return { stdout: "", stderr: "", code: 0 }
+    },
+    async start() {
+      let alive = true
+      const child: WorkspaceChild = { running: () => alive, async kill() { alive = false }, async wait() { alive = false; return { code: 0, stdout: "", stderr: "" } } }
+      return child
+    },
+  }
+  const fs = {
+    async mkdir(path: string) { files.add(path) },
+    async rm(path: string) { files.delete(path) },
+    async exists(path: string) { return files.has(path) },
+    async chmod() {},
+    async lstat(path: string) {
+      if (!files.has(path)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" })
+      return { isSymbolicLink: () => false }
+    },
+  }
+  const adapter = createWorkspaceAdapter({ home, runner, fs })
+  const configs = await Promise.all(["one", "two"].map((id) => adapter.configure({
+    id: `setup-hook-${suffix}-${id}`, type: "sshfs", name: "SSHFS", branch: null, directory: null,
+    extra: { host: id === "one" ? "alpha" : "beta", path: id === "one" ? "/srv/project" : "/srv/other" }, projectID: "p",
+  })))
+  await Promise.all(configs.map((config) => adapter.create(config, {})))
+  const roots = configs.map((config) => config.directory!)
+  const originalConnectWorkspace = SshConnections.prototype.connectWorkspace
+  let before: ((event: any) => Promise<void>) | undefined
+  let connected: { host: string; remotePath: string; localDirectory: string } | undefined
+  let setupConnections: SshConnections | undefined
+  SshConnections.prototype.connectWorkspace = async function (_sessionID, host, remotePath, localDirectory) {
+    setupConnections = this
+    connected = { host, remotePath, localDirectory }
+    const state = { host, remotePath, localDirectory, mode: "workspace" as const, socketPath: "/tmp/setup-v2-hook.sock" }
+    ;(this as any).states.set(_sessionID, state)
+    return state
+  }
+  try {
+    const context = {
+      options: {},
+      tool: {
+        transform: async () => {},
+        hook: async (name: string, hook: (event: any) => Promise<void>) => { if (name === "execute.before") before = hook },
+      },
+      session: { hook: async () => {} },
+      event: { subscribe: async function* () {} },
+    }
+    const cleanup = await setupV2(context as never)
+    assert.ok(before)
+    await before!({ id: "managed-descendant", tool: "shell", sessionID: "setup-session", input: { command: "pwd", workdir: `${roots[0]}/src/file` } })
+    assert.deepEqual(connected, { host: "alpha", remotePath: "/srv/project/src/file", localDirectory: roots[0] })
+    await assert.rejects(
+      () => before!({ id: "cross-root", tool: "shell", sessionID: "setup-session", input: { command: "pwd", workdir: `${roots[1]}/other` } }),
+      /outside the associated managed mount/,
+    )
+    ;(setupConnections as any)?.states.clear()
+    await cleanup()
+  } finally {
+    SshConnections.prototype.connectWorkspace = originalConnectWorkspace
+    await adapter.cleanup()
+  }
+})
+
+test("setupV2 safely no-ops when the native context exposes an incomplete tool hook", async () => {
+  const cleanup = await setupV2({
+    options: {},
+    tool: { transform: async () => {}, hook: async () => {} },
+  } as never)
+  assert.equal(typeof cleanup, "function")
+  await cleanup()
 })
 
 test("package namespace exposes the compatibility setup under its non-colliding name", () => {
