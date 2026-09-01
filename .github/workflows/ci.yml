@@ -97,6 +97,7 @@ jobs:
 
           const [pack] = JSON.parse(readFileSync("pack.json", "utf8"))
           const expected = [
+            "LICENSE",
             "README.md",
             "dist/src/index.d.ts",
             "dist/src/index.js",
