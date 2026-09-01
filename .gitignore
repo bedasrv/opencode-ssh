@@ -6,4 +6,8 @@ dist/src/*
 !dist/src/index.d.ts
 !dist/src/ssh.js
 !dist/src/ssh.d.ts
+!dist/src/channel.js
+!dist/src/channel.d.ts
+!dist/src/pty-helper.js
+!dist/src/pty-helper.d.ts
 .DS_Store

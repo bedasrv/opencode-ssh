@@ -43,6 +43,9 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts --no-audit --no-fund
 
+      - name: Build node-pty native dependency
+        run: npm rebuild node-pty --ignore-scripts=false --no-audit --no-fund
+
       - name: Typecheck
         run: npm run typecheck
 
@@ -75,6 +78,9 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts --no-audit --no-fund
 
+      - name: Build node-pty native dependency
+        run: npm rebuild node-pty --ignore-scripts=false --no-audit --no-fund
+
       - name: Build package
         run: npm run build
 
@@ -96,7 +102,11 @@ jobs:
             "dist/src/index.js",
             "dist/src/ssh.d.ts",
             "dist/src/ssh.js",
+            "dist/src/channel.d.ts",
+            "dist/src/channel.js",
             "package.json",
+            "dist/src/pty-helper.d.ts",
+            "dist/src/pty-helper.js",
           ]
           const actual = pack.files.map(({ path }) => path).sort()
           const sortedExpected = [...expected].sort()

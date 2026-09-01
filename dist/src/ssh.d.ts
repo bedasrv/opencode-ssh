@@ -28,7 +28,7 @@ export type ConnectionState = {
     configPath?: string;
 };
 /** Local workspace tools disabled while an SSH session owns the shell. */
-export declare const LOCAL_WORKSPACE_TOOLS: readonly ["read", "write", "edit", "patch", "glob", "grep"];
+export declare const LOCAL_WORKSPACE_TOOLS: readonly ["read", "write", "edit", "patch", "apply_patch", "glob", "grep"];
 export type ShellExecuteBeforeEvent = {
     tool: string;
     sessionID: string;
@@ -45,9 +45,9 @@ export declare function validateHost(host: string): void;
 export declare function wrapRemoteCommand(socket: string, host: string, command: string, configPath?: string): string;
 /**
  * Rewrites tool executions for sessions in remote mode:
- * - shell: idempotently wraps the command through the session's ControlMaster and
+ * - shell/bash: idempotently wraps the command through the session's ControlMaster and
  *   strips local workdir/cwd so nothing local leaks into remote execution.
- * - local workspace tools (read/write/edit/patch/glob/grep): rejected so a stale
+ * - local workspace tools (read/write/edit/patch/apply_patch/glob/grep): rejected so a stale
  *   tool list captured before ssh_connect cannot touch the workspace mid-turn.
  * Returns true when a remote shell execution was observed.
  */

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/bedasrv/opencode-ssh/actions/workflows/ci.yml/badge.svg)](https://github.com/bedasrv/opencode-ssh/actions/workflows/ci.yml)
 
-An OpenCode v2 plugin that runs shell commands through a persistent SSH ControlMaster. It uses SSH host aliases from `~/.ssh/config`; OpenCode itself does not need to be installed on the remote host.
+An OpenCode plugin with a certified legacy server() surface and a conditional setupV2() surface. It runs shell commands through a persistent SSH ControlMaster and uses SSH host aliases from ~/.ssh/config; OpenCode itself does not need to be installed on the remote host.
 
 ## Install
 
@@ -17,13 +17,13 @@ Add it to `~/.config/opencode/opencode.json`:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": [{"package": "./node_modules/opencode-ssh", "options": {}}]
+  "plugin": ["./node_modules/opencode-ssh"]
 }
 ```
 
-For a local source checkout, reference the installed package by its explicit local path, `./node_modules/opencode-ssh`. A bare package name like `opencode-ssh` is treated as an npm registry dependency (and fails with `No versions available for opencode-ssh`). Local paths must start with `./` and are resolved relative to `~/.config/opencode/opencode.json`.
+For a local source checkout, install the package into `~/.config/opencode` as above, then reference the installed package by its explicit local path, `./node_modules/opencode-ssh`. The singular `plugin` key is the OpenCode v2 configuration key. Local paths start with `./` and are resolved relative to `~/.config/opencode/opencode.json`.
 
-The plugin requires the OpenCode v2 beta plugin runtime.
+The package exports both server() and setupV2() surfaces. On the verified OpenCode runtime 0.0.0-dev-202608311804, the certified model-facing route is the legacy server() surface through /session and /experimental/tool. A live /api/session probe on this runtime did not expose the custom SSH tools, so the native /api/session setupV2() path is not production-supported here. The setupV2() export is retained for compatible runtimes that provide the required custom-tool registration API; do not treat this package as blanket v2 support.
 
 ## Usage
 
@@ -33,11 +33,17 @@ Ask the model to connect to an alias, for example:
 Connect to myHost
 ```
 
-The model calls `ssh_connect`. Both `ssh_connect` and `ssh_disconnect` are first-class direct tools (`options.codemode: false` with a declared output schema), so call them directly — not through Code Mode `execute`. They return structured results, and failures surface as tool errors carrying the real error message instead of a generic "Tool execution failed". After connection, the v2 shell tool hook rewrites every shell command using that OpenCode session's persistent ControlMaster. This is not dependent on prompt instructions. Remote commands start in the SSH login shell's working directory; OpenCode's local workdir is stripped from remote shell calls rather than translated to a remote `cd`. Use `ssh_disconnect` or ask to return local to close it.
+The model calls `ssh_connect`. Both `ssh_connect` and `ssh_disconnect` are first-class direct tools (`options.codemode: false` with a declared output schema), so call them directly — not through Code Mode `execute`. They return structured results, and failures surface as tool errors carrying the real error message instead of a generic "Tool execution failed". After connection, the shell tool hook rewrites every shell command using that OpenCode session's persistent ControlMaster. This is not dependent on prompt instructions. Remote commands start in the SSH login shell's working directory; OpenCode's local workdir is stripped from remote shell calls rather than translated to a remote `cd`. Use `ssh_disconnect` or ask to return local to close it.
+
+### Interactive channels
+
+Use `ssh_channel_open` with a validated SSH alias to create a persistent interactive terminal. Use `ssh_channel_read` and `ssh_channel_write` for UTF-8 terminal text (including control characters and NUL; this is not arbitrary binary transport), `ssh_channel_resize` for viewport changes, `ssh_channel_status` for state, and `ssh_channel_close` when finished. Channel writes are limited to 64 KiB after UTF-8 encoding. The plugin owns a real PTY running `ssh -tt`, so nested `ssh`, `telnet`, `picocom`, serial consoles, and `docker exec -it` can run without wrappers. Output is bounded to 64 KiB and reads return a cursor plus dropped-byte count. Channels persist across prompts while the plugin process remains alive; they are not recoverable after a plugin restart.
 
 ## SSH setup
 
 Use an SSH key or an SSH agent. Password prompts and `sshpass` are intentionally unsupported; master startup uses `BatchMode=yes`, so a missing key or passphrase fails fast instead of hanging. Every `ssh` invocation passes `-F ~/.ssh/config` explicitly when that file exists, so an overridden process `HOME` cannot silently switch OpenSSH to a different config.
+
+Interactive channels use the plugin-owned `node-pty` process transport. The child receives a minimal environment containing the configured home, PATH, terminal type, SSH agent socket, and locale values; unrelated OpenCode service variables are not inherited. PTY state is process-local and is intentionally not recovered after plugin restart.
 
 ```sshconfig
 Host myHost
@@ -65,7 +71,7 @@ The release workflow publishes a tagged package after the full CI workflow passe
 
 ## Files
 
-Shell file commands such as `cat`, `tee`, `find`, and remote `grep` run on the server. OpenCode's local `read`, `write`, `edit`, `patch`, `glob`, and `grep` tools are removed from the session context while remote mode is active, preventing accidental local edits or searches; a stale tool list captured before connecting is also rejected if it attempts `write` or `patch` mid-turn. Disconnect to restore local tools.
+Shell file commands such as `cat`, `tee`, `find`, and remote `grep` run on the server. Both OpenCode shell tool names, `shell` and legacy `bash`, are rewritten through the ControlMaster while remote mode is active. In v2, local workspace tools may be removed from the session context; in legacy mode, `read`, `write`, `edit`, `patch`, `apply_patch`, `glob`, and `grep` are rejected at execution time, including when a stale tool list attempts to invoke them. Disconnect to restore local tools.
 
 Control sockets are kept in a private `~/.ssh/opencode-ssh` directory whose `0700` mode is enforced on every connect (symlinked socket directories are refused). Socket names are collision-resistant, and sockets are removed when a session disconnects or the plugin is cleaned up. Deleting an OpenCode session disconnects it as well. Stale sockets are discarded and healthy masters are reused.
 

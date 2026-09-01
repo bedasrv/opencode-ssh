@@ -9,16 +9,20 @@
     ".": "./dist/src/index.js"
   },
   "license": "MIT",
-  "files": ["dist/src"],
+  "files": [
+    "dist/src"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/bedasrv/opencode-ssh"
   },
   "engines": {
-    "opencode": "0.0.0-beta-17793"
+    "opencode": "0.0.0-dev-202608311804"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "0.0.0-beta-17793"
+    "@opencode-ai/plugin": "0.0.0-dev-202608311804",
+    "node-pty": "^1.1.0",
+    "zod": "4.1.8"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

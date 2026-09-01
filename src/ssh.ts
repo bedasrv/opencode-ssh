@@ -19,7 +19,7 @@ export type FileOps = {
 export type ConnectionState = { host: string; socketPath: string; configPath?: string }
 
 /** Local workspace tools disabled while an SSH session owns the shell. */
-export const LOCAL_WORKSPACE_TOOLS = ["read", "write", "edit", "patch", "glob", "grep"] as const
+export const LOCAL_WORKSPACE_TOOLS = ["read", "write", "edit", "patch", "apply_patch", "glob", "grep"] as const
 
 export type ShellExecuteBeforeEvent = {
   tool: string
@@ -61,9 +61,9 @@ const wrapRecords = new WeakMap<object, WrapRecord>()
 
 /**
  * Rewrites tool executions for sessions in remote mode:
- * - shell: idempotently wraps the command through the session's ControlMaster and
+ * - shell/bash: idempotently wraps the command through the session's ControlMaster and
  *   strips local workdir/cwd so nothing local leaks into remote execution.
- * - local workspace tools (read/write/edit/patch/glob/grep): rejected so a stale
+ * - local workspace tools (read/write/edit/patch/apply_patch/glob/grep): rejected so a stale
  *   tool list captured before ssh_connect cannot touch the workspace mid-turn.
  * Returns true when a remote shell execution was observed.
  */
@@ -75,7 +75,7 @@ export function transformShellExecuteBefore(
   const state = getState(event.sessionID)
   if (!state) return false
 
-  if (event.tool !== "shell") {
+  if (event.tool !== "shell" && event.tool !== "bash") {
     if ((LOCAL_WORKSPACE_TOOLS as readonly string[]).includes(event.tool)) {
       throw remotePolicyError(event.tool, state.host)
     }
