@@ -528,6 +528,67 @@ test("workspace connections bind per session and preserve local tools", async ()
   await connections.cleanup()
 })
 
+test("repeated workspace connects reuse a healthy master without checking it each time", async () => {
+  const runner = new FakeRunner()
+  const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(new Set()) })
+
+  await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+  await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+  await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+
+  assert.equal(runner.calls.filter((call) => call.args[0] === "-O" && call.args[1] === "check").length, 1)
+  await connections.cleanup()
+})
+
+test("workspace health checks run again when the configured interval expires", async () => {
+  const runner = new FakeRunner()
+  let now = 1000
+  const connections = new SshConnections({
+    home: "/home/test",
+    runner,
+    fs: memoryFs(new Set()),
+    healthCheckIntervalMs: 1000,
+    now: () => now,
+  })
+
+  await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+  await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+  now += 1000
+  await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+
+  assert.equal(runner.calls.filter((call) => call.args[0] === "-O" && call.args[1] === "check").length, 2)
+  await connections.cleanup()
+})
+
+test("workspace health-check cache entries are isolated per session", async () => {
+  const runner = new FakeRunner()
+  const now = 1000
+  const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(new Set()), now: () => now })
+
+  await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+  await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+  await connections.connectWorkspace("two", "alpha", "/srv/two", "/mnt/two")
+  await connections.connectWorkspace("two", "alpha", "/srv/two", "/mnt/two")
+
+  assert.equal(runner.calls.filter((call) => call.args[0] === "-O" && call.args[1] === "check").length, 2)
+  await connections.cleanup()
+})
+
+test("disconnect invalidates the workspace health-check cache", async () => {
+  const runner = new FakeRunner()
+  const now = 1000
+  const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(new Set()), now: () => now })
+
+  await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+  await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+  await connections.disconnect("one")
+  await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+  await connections.connectWorkspace("one", "alpha", "/srv/one", "/mnt/one")
+
+  assert.equal(runner.calls.filter((call) => call.args[0] === "-O" && call.args[1] === "check").length, 2)
+  await connections.cleanup()
+})
+
 test("workspace shell preparation routes ready descendants and fails closed outside the mount", async () => {
   const runner = new FakeRunner()
   const connections = new SshConnections({ home: "/home/test", runner, fs: memoryFs(new Set()) })

@@ -165,13 +165,20 @@ function describeError(error) {
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export class SshConnections {
     states = new Map();
+    healthChecks = new Map();
     disconnecting = new Set();
     operations = new Map();
     shells = new Map();
     closing = null;
     options;
     constructor(options) {
-        this.options = { ...options, home: options.home ?? homedir(), shellDrainMs: options.shellDrainMs ?? 1000 };
+        this.options = {
+            ...options,
+            home: options.home ?? homedir(),
+            shellDrainMs: options.shellDrainMs ?? 1000,
+            healthCheckIntervalMs: options.healthCheckIntervalMs ?? 1000,
+            now: options.now ?? Date.now,
+        };
     }
     get(sessionID) { return this.states.get(sessionID); }
     /**
@@ -236,7 +243,7 @@ export class SshConnections {
             const existing = this.states.get(sessionID);
             if (existing?.mode === "workspace" && existing.host === host) {
                 try {
-                    await this.options.runner.run("ssh", this.sshArgs(["-O", "check", "-S", existing.socketPath, host], existing.configPath), { timeout: 5000 });
+                    await this.checkMaster(sessionID, existing);
                     existing.remotePath = remotePath;
                     existing.localDirectory = localDirectory;
                     return existing;
@@ -253,6 +260,20 @@ export class SshConnections {
             state.localDirectory = localDirectory;
             return state;
         });
+    }
+    async checkMaster(sessionID, state) {
+        const cached = this.healthChecks.get(sessionID);
+        const age = cached ? this.options.now() - cached.checkedAt : Infinity;
+        if (cached?.socketPath === state.socketPath && age >= 0 && age < this.options.healthCheckIntervalMs)
+            return;
+        try {
+            await this.options.runner.run("ssh", this.sshArgs(["-O", "check", "-S", state.socketPath, state.host], state.configPath), { timeout: 5000 });
+            this.healthChecks.set(sessionID, { socketPath: state.socketPath, checkedAt: this.options.now() });
+        }
+        catch (error) {
+            this.healthChecks.delete(sessionID);
+            throw error;
+        }
     }
     async connectUnlocked(sessionID, host) {
         validateHost(host);
@@ -310,8 +331,10 @@ export class SshConnections {
     }
     async disconnectUnlocked(sessionID) {
         const state = this.states.get(sessionID);
-        if (!state)
+        if (!state) {
+            this.healthChecks.delete(sessionID);
             return;
+        }
         // Mark disconnecting BEFORE any waiting so shell hooks during the drain
         // throw instead of falling through to local execution; the state stays
         // visible to ordinary get() until teardown completes.
@@ -327,6 +350,7 @@ export class SshConnections {
         finally {
             this.disconnecting.delete(sessionID);
             this.states.delete(sessionID);
+            this.healthChecks.delete(sessionID);
         }
     }
     /** Best-effort bounded wait for in-flight remote shells so masters are not stopped underneath them. */

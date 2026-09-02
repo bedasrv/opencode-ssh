@@ -208,14 +208,21 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 export class SshConnections {
   private readonly states = new Map<string, ConnectionState>()
+  private readonly healthChecks = new Map<string, { socketPath: string; checkedAt: number }>()
   private readonly disconnecting = new Set<string>()
   private readonly operations = new Map<string, Promise<void>>()
   private readonly shells = new Map<string, number>()
   private closing: Promise<void> | null = null
-  private readonly options: { home: string; runner: ProcessRunner; fs: FileOps; shellDrainMs: number }
+  private readonly options: { home: string; runner: ProcessRunner; fs: FileOps; shellDrainMs: number; healthCheckIntervalMs: number; now: () => number }
 
-  constructor(options: { home?: string; runner: ProcessRunner; fs: FileOps; shellDrainMs?: number }) {
-    this.options = { ...options, home: options.home ?? homedir(), shellDrainMs: options.shellDrainMs ?? 1000 }
+  constructor(options: { home?: string; runner: ProcessRunner; fs: FileOps; shellDrainMs?: number; healthCheckIntervalMs?: number; now?: () => number }) {
+    this.options = {
+      ...options,
+      home: options.home ?? homedir(),
+      shellDrainMs: options.shellDrainMs ?? 1000,
+      healthCheckIntervalMs: options.healthCheckIntervalMs ?? 1000,
+      now: options.now ?? Date.now,
+    }
   }
 
   get(sessionID: string): ConnectionState | undefined { return this.states.get(sessionID) }
@@ -278,12 +285,26 @@ export class SshConnections {
     return this.runExclusive(sessionID, async () => {
       const existing = this.states.get(sessionID)
       if (existing?.mode === "workspace" && existing.host === host) {
-        try { await this.options.runner.run("ssh", this.sshArgs(["-O", "check", "-S", existing.socketPath, host], existing.configPath), { timeout: 5000 }); existing.remotePath = remotePath; existing.localDirectory = localDirectory; return existing } catch { await this.disconnectUnlocked(sessionID) }
+        try { await this.checkMaster(sessionID, existing); existing.remotePath = remotePath; existing.localDirectory = localDirectory; return existing } catch { await this.disconnectUnlocked(sessionID) }
       } else if (existing) await this.disconnectUnlocked(sessionID)
       const state = await this.connectUnlocked(sessionID, host)
       state.mode = "workspace"; state.remotePath = remotePath; state.localDirectory = localDirectory
       return state
     })
+  }
+
+  private async checkMaster(sessionID: string, state: ConnectionState): Promise<void> {
+    const cached = this.healthChecks.get(sessionID)
+    const age = cached ? this.options.now() - cached.checkedAt : Infinity
+    if (cached?.socketPath === state.socketPath && age >= 0 && age < this.options.healthCheckIntervalMs) return
+
+    try {
+      await this.options.runner.run("ssh", this.sshArgs(["-O", "check", "-S", state.socketPath, state.host], state.configPath), { timeout: 5000 })
+      this.healthChecks.set(sessionID, { socketPath: state.socketPath, checkedAt: this.options.now() })
+    } catch (error) {
+      this.healthChecks.delete(sessionID)
+      throw error
+    }
   }
 
   private async connectUnlocked(sessionID: string, host: string): Promise<ConnectionState> {
@@ -341,7 +362,10 @@ export class SshConnections {
 
   private async disconnectUnlocked(sessionID: string): Promise<void> {
     const state = this.states.get(sessionID)
-    if (!state) return
+    if (!state) {
+      this.healthChecks.delete(sessionID)
+      return
+    }
     // Mark disconnecting BEFORE any waiting so shell hooks during the drain
     // throw instead of falling through to local execution; the state stays
     // visible to ordinary get() until teardown completes.
@@ -353,6 +377,7 @@ export class SshConnections {
     } finally {
       this.disconnecting.delete(sessionID)
       this.states.delete(sessionID)
+      this.healthChecks.delete(sessionID)
     }
   }
 

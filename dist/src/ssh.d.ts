@@ -84,6 +84,7 @@ export declare function consumeSessionDeletions(events: AsyncIterable<SessionEve
 };
 export declare class SshConnections {
     private readonly states;
+    private readonly healthChecks;
     private readonly disconnecting;
     private readonly operations;
     private readonly shells;
@@ -94,6 +95,8 @@ export declare class SshConnections {
         runner: ProcessRunner;
         fs: FileOps;
         shellDrainMs?: number;
+        healthCheckIntervalMs?: number;
+        now?: () => number;
     });
     get(sessionID: string): ConnectionState | undefined;
     /**
@@ -110,6 +113,7 @@ export declare class SshConnections {
     private runExclusive;
     connect(sessionID: string, host: string): Promise<ConnectionState>;
     connectWorkspace(sessionID: string, host: string, remotePath: string, localDirectory: string): Promise<ConnectionState>;
+    private checkMaster;
     private connectUnlocked;
     /** Prepends -F so OpenSSH uses the pinned per-user config instead of resolving one from the process HOME. */
     private sshArgs;
